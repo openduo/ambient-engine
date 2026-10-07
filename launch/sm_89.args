@@ -1,0 +1,35 @@
+# llama-server arguments for one sm_89 (Ada) or sm_86 (Ampere) card. One argument per line.
+# Replace <MODEL_GGUF> and <DRAFTER_GGUF>; see README.md in this directory for each flag.
+--model
+<MODEL_GGUF>
+--host
+127.0.0.1
+--port
+8080
+--ctx-size
+32768
+--n-gpu-layers
+all
+--parallel
+1
+--jinja
+--reasoning
+off
+--flash-attn
+on
+--cache-type-k
+f16
+--cache-type-v
+f16
+--cache-prompt
+--no-context-shift
+--metrics
+--no-warmup
+--alias
+Ternary-Bonsai-2-27B-PTQ1_0
+--spec-type
+draft-mtp
+--spec-draft-model
+<DRAFTER_GGUF>
+--spec-draft-n-max
+3

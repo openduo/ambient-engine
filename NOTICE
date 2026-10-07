@@ -1,0 +1,40 @@
+ambient-engine
+Copyright 2026 openduo
+
+The patch, scripts and documentation in this repository are licensed under
+FSL-1.1-Apache-2.0 (see LICENSE).
+
+The patch modifies and adds to llama.cpp, fetched at build time from
+https://github.com/PrismML-Eng/llama.cpp (a fork of
+https://github.com/ggml-org/llama.cpp). That code, including the parts of it
+that appear as context in the patch, remains under the MIT License below.
+Applying the patch does not change the license of the upstream code.
+
+The MIT License below is copied verbatim from the LICENSE file at the pinned
+upstream commit (see UPSTREAM). Notices inside individual upstream files
+(for example in ggml/src/ggml-cpu/ops.cpp) stay in place; the patch does not
+change them.
+
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
