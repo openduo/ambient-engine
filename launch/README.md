@@ -11,7 +11,7 @@ The same arguments apply to both architectures. Compute capability 9.0 and newer
 With `sm_89.args` the server requires 9,704 MiB of device memory after load. The bounded device
 checkpoint pool (see Prompt checkpoints) can raise this to at most 12,336 MiB, so the card needs at
 least 12,336 MiB free for the server. Both figures include the MTP drafter. A larger `--ctx-size`
-needs more.
+or more slots need more; for two slots see Two slots.
 
 ## Run
 
@@ -42,7 +42,7 @@ loading, it returns 503.
 | `--port 8080` | Listen port; 8080 is the upstream default. Any free port works; the client URL must match it. | None. |
 | `--ctx-size 32768` | Context length of the single slot. It must hold prompt plus output. | Attention KV cache grows linearly with it and is allocated at load. The recurrent state does not depend on it. |
 | `--n-gpu-layers all` | Offload every layer to the GPU. | All weights live in VRAM. |
-| `--parallel 1` | One server slot. Requests are served one at a time. | One sequence of KV cache and recurrent state. |
+| `--parallel 1` | One server slot. Requests are served one at a time. For two slots see Two slots. | One sequence of KV cache and recurrent state. |
 | `--jinja` | Render prompts with the chat template stored in the GGUF. Needed for tool calls. | None. |
 | `--reasoning off` | Disable thinking in the chat template (`enable_thinking=false`). | None. |
 | `--flash-attn on` | Use the Flash Attention kernels. | Smaller attention scratch buffers. |
@@ -61,9 +61,32 @@ loading, it returns 503.
 
 The model mixes attention layers with recurrent (gated delta net) layers. A recurrent state cannot
 be truncated, so prefix reuse restores a saved checkpoint of it. Checkpoints are kept on the device
-in a pool of at most `device_state_pool_max` snapshots (`src/llama-context.h`). When the pool is
-full, later checkpoints use the host memory path. This bounds the device checkpoint pool only;
-other allocations (weights, KV cache, compute buffers, the drafter) follow upstream behavior.
+in a pool of at most `--ctx-checkpoints-device N` snapshots (default 16, environment variable
+`LLAMA_ARG_CTX_CHECKPOINTS_DEVICE`). The pool belongs to the server's context, so all slots share
+it. When the pool is full, later checkpoints use the host memory path. This bounds the device
+checkpoint pool only; other allocations (weights, KV cache, compute buffers, the drafter) follow
+upstream behavior.
+
+With the recommended arguments each device checkpoint holds about 150 MiB, and the device memory
+figures above assume the default of 16. A smaller N lowers the ceiling by that amount per
+checkpoint. The cost is time: a checkpoint kept in host memory is copied over PCIe when it is saved
+and when it is restored, so prompt reuse from it takes longer than from a device checkpoint. `0`
+keeps every checkpoint in host memory.
+
+## Two slots
+
+`sm_89.args` runs one slot, so requests are served one at a time. To serve two requests at once,
+change two values in a copy of the file:
+
+| flag | one slot | two slots |
+| --- | --- | --- |
+| `--parallel` | `1` | `2` |
+| `--ctx-size` | `32768` | `65536` |
+
+`--ctx-size` is the total for all slots, so each slot still holds 32,768 tokens. With two slots the
+server requires 12,478 MiB of device memory after load and up to 15,110 MiB with the device
+checkpoint pool full; both include the MTP drafter. A 24 GB card has room for this.
+`--ctx-checkpoints-device` lowers the ceiling (see Prompt checkpoints).
 
 ## Environment
 

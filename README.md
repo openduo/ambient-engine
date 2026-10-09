@@ -42,16 +42,30 @@ fallback.
   type and shape checks. Other cards and shapes use the separate operations.
 - On Ada (sm_89), a gated delta net kernel that updates four state columns per warp, for longer
   batches.
+- On Ada (sm_89), `PTQ1_0` mat-muls that share one input quantize it to Q8_1 once. Each shared
+  buffer is released after its last reader in the graph, so the buffers of different layers are not
+  held at the same time.
+- On CUDA, a batch with one sequence reads the recurrent state in place from the cache, and the
+  gated delta net writes its snapshots directly into the cache, without gathered copies. Batches
+  with several sequences use the gathered path.
 - Recurrent-state snapshots taken inside the prompt decode and used as prompt-cache checkpoints.
   This needs a model whose GGUF architecture is `qwen35` or `qwen35moe`, and speculative decoding
   (for example `--spec-type draft-mtp`) with `--spec-draft-n-max` from 1 to 3; the recurrent
   rollback planes hold the snapshots. Otherwise checkpoints are saved as upstream does.
-- A bounded pool of device-resident checkpoints. When it is full, checkpoints use host memory.
+- A bounded pool of device-resident checkpoints, shared by all slots. Its size is set with
+  `--ctx-checkpoints-device N` (default 16; 0 keeps every checkpoint in host memory). When the pool
+  is full, checkpoints use host memory. See
+  [Prompt checkpoints](launch/README.md#prompt-checkpoints).
 - The MTP drafter receives every prompt row after a cache restore. With one active sequence, an
   MTP drafter whose GGUF architecture is `qwen35`, `--spec-draft-n-max 3` and `--spec-draft-p-min`
   at 0 (the default), the three draft steps run as one greedy chain inside one graph. In that chain
   the draft head uses only the base Qwen vocabulary rows, unless a LoRA adapter is loaded or the
-  output head is folded. The target model verifies each draft token.
+  output head is folded. The target model verifies each draft token. When the verify batch holds
+  only that slot's draft tokens, the draft tokens are copied to the target's input on the device;
+  otherwise they pass through host memory.
+- More than one server slot (`--parallel 2` or higher) is supported. See
+  [Two slots](launch/README.md#two-slots). As in upstream, a response can differ slightly
+  depending on which other requests share its batch.
 - Chat prompts are tokenized one message at a time when message delimiters start with a special
   token that does not strip whitespace to its left and the tokenizer appends no EOS or SEP token,
   with a bounded cache of unchanged messages.
@@ -121,5 +135,9 @@ version converts to Apache-2.0 two years after it is made available; see Release
 
 ## Release
 
-- Published: 2026-10-07
-- Apache-2.0 from: 2028-10-07
+Versions are the commits of this repository that change `patches/ambient-engine.patch`.
+
+| version | published | Apache-2.0 from |
+| --- | --- | --- |
+| 1 | 2026-10-07 | 2028-10-07 |
+| 2 | 2026-10-09 | 2028-10-09 |
