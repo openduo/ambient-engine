@@ -761,20 +761,31 @@ index 12ae31b7d..5fc6eba37 100644
  void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
  
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index d875a15ed..9ce10a064 100644
+index d875a15ed..9486a6736 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -224,6 +224,9 @@
+@@ -224,6 +224,12 @@
  #define GGML_MAX_SRC            10
  #define GGML_MAX_N_THREADS      512
  #define GGML_MAX_OP_PARAMS      64
 +// Planes addressable by ggml_gated_delta_net_set_snapshot_indices: op params
 +// 2..5 carry the indices and backend kernels take exactly this many.
 +#define GGML_GATED_DELTA_NET_MAX_SNAPSHOT_PLANES 4
++// Op param of a gated_delta_net that holds its journal capacity (0: no journal);
++// it follows K, raw gates, the plane indices and the custom-mode flag.
++#define GGML_GATED_DELTA_NET_JOURNAL_PARAM (3 + GGML_GATED_DELTA_NET_MAX_SNAPSHOT_PLANES)
  
  #ifndef GGML_MAX_NAME
  #   define GGML_MAX_NAME        64
-@@ -2620,6 +2623,22 @@ extern "C" {
+@@ -576,6 +582,7 @@ extern "C" {
+         GGML_OP_RWKV_WKV7,
+         GGML_OP_SOLVE_TRI,
+         GGML_OP_GATED_DELTA_NET,
++        GGML_OP_GATED_DELTA_NET_COMMIT,
+         GGML_OP_LIGHTNING_INDEXER,
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+@@ -2620,6 +2627,22 @@ extern "C" {
              struct ggml_tensor  * rows,
              int                   n_snap_slots);
  
@@ -797,7 +808,7 @@ index d875a15ed..9ce10a064 100644
      // fold the per-head gate activations into a gated_delta_net op (scalar gate only):
      //   beta -> sigmoid(beta),  g -> a[h] * softplus(g + dt_bias[h])
      // dt_bias and a are F32 with H_v elements; removes four elementwise ops per layer
-@@ -2628,6 +2647,14 @@ extern "C" {
+@@ -2628,6 +2651,74 @@ extern "C" {
              struct ggml_tensor  * dt_bias,
              struct ggml_tensor  * a);
  
@@ -809,14 +820,86 @@ index d875a15ed..9ce10a064 100644
 +            const int32_t      * indices,
 +            int32_t              count);
 +
++    // Rollback journal (scalar gate only). Instead of K state snapshots, the
++    // op stores one base state and the operands of its last tokens:
++    //   c = min(n_tokens, n_journal) journal entries for the last c tokens,
++    //   base = the state after token n_tokens-1-c (the input state if c == n_tokens).
++    // Entry e (oldest first) holds k [S_v, H_k], delta [S_v, H_v] and the
++    // activated gate g [H_v] of its token, exactly as the state update used them,
++    // so ggml_gated_delta_net_commit can recompute s = g*s + k*delta bit for bit.
++    // Entry size in floats:
++    GGML_API int64_t ggml_gated_delta_net_journal_entry_size(int64_t S_v, int64_t H_k, int64_t H_v);
++
++    // ggml_gated_delta_net with a journal: one state slot (the base) follows the
++    // attention scores, then the journal of every sequence ([n_journal * entry, n_seqs]),
++    // padded to whole rows.
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_journal(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * state,
++            int                   n_journal);
++
++    // ggml_gated_delta_net_rows_commit with a journal: the base state goes to
++    // write_states ([D, n_seqs, 1]); the result holds the attention scores and
++    // then the journal, laid out as in ggml_gated_delta_net_journal.
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_rows_commit_journal(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * states,
++            struct ggml_tensor  * read_rows,
++            struct ggml_tensor  * write_states,
++            int                   n_journal);
++
++    // Offset in floats of the journal inside the result of the two ops above.
++    GGML_API size_t ggml_gated_delta_net_journal_offset(const struct ggml_tensor * gdn);
++
++    // Apply journal entries to base states, in place. Returns a view of states.
++    //   states  : F32 [S_v*S_v*H_v, n_rows], rows of base states
++    //   journal : F32 [n_journal*entry, n_rows], row r is the journal of state row r
++    //   plan    : I32 [2*n_pairs] of (row, count) pairs; count 0 skips the pair.
++    //             If NULL, `count` entries of row 0 are applied.
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_commit(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * states,
++            struct ggml_tensor  * journal,
++            struct ggml_tensor  * plan,
++            int64_t               S_v,
++            int64_t               H_k,
++            int64_t               H_v,
++            int                   n_journal,
++            int                   count);
++
++    // Sets `count` of a commit node built with plan == NULL, so one graph can be reused.
++    GGML_API void ggml_gated_delta_net_commit_set_count(struct ggml_tensor * commit, int count);
++
      // DSA lightning indexer
      //
      // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 9cd2c2d39..a84bae5ff 100644
+index 9cd2c2d39..56c9ef63f 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -3011,7 +3011,7 @@ struct ggml_cplan ggml_graph_plan(
+@@ -2081,6 +2081,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_gated_delta_net(params, tensor);
+             } break;
++        case GGML_OP_GATED_DELTA_NET_COMMIT:
++            {
++                // the journal commit is CUDA-only; supports_op keeps it off the CPU
++                GGML_ABORT("GGML_OP_GATED_DELTA_NET_COMMIT is not supported on the CPU");
++            }
+         case GGML_OP_LIGHTNING_INDEXER:
+             {
+                 ggml_compute_forward_lightning_indexer(params, tensor);
+@@ -3011,7 +3016,7 @@ struct ggml_cplan ggml_graph_plan(
                      {
                          const int64_t S_v = node->src[2]->ne[0];
                          const int64_t K   = ggml_get_op_params_i32(node, 0);
@@ -825,6 +908,22 @@ index 9cd2c2d39..a84bae5ff 100644
                          cur = per_thread * sizeof(float) * n_tasks;
                      } break;
                  case GGML_OP_COUNT:
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 1df0f2bb9..24b529941 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -440,6 +440,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_GATED_DELTA_NET_COMMIT:
++            return false;
++        case GGML_OP_GATED_DELTA_NET:
++            // the rollback journal is CUDA-only
++            return ggml_get_op_params_i32(op, GGML_GATED_DELTA_NET_JOURNAL_PARAM) == 0;
+         case GGML_OP_CPY:
+         case GGML_OP_SET_ROWS:
+             return
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
 index 4fc7514bb..a90b4b0dd 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
@@ -1172,19 +1271,21 @@ index 62b2f288d..21248582c 100644
 +                                     const ggml_tensor * src, const ggml_tensor * gate,
 +                                     const ggml_tensor * signs, void * dst_q8, int n);
 diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
-index 5cf6968a6..17b844b67 100644
+index 5cf6968a6..79852bc78 100644
 --- a/ggml/src/ggml-cuda/gated_delta_net.cu
 +++ b/ggml/src/ggml-cuda/gated_delta_net.cu
-@@ -11,7 +11,7 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
+@@ -11,7 +11,9 @@ static __global__ void gdn_precompute_exp(const float * g, float * g_exp, int64_
  // RAW: beta and g arrive pre-activation (ggml_gated_delta_net_set_raw_gates); the kernel applies
  // sigmoid(beta) and raw_a[h] * softplus(g + raw_dt_bias[h]) with the unary kernels' formulas.
  // G_PRECOMPUTED: g already holds exp(g) (GB10 long-prompt path); only used with RAW == false.
 -template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
-+template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, int COLS_PER_WARP = 1>
++// JOURNAL: rollback journal (ggml_gated_delta_net_journal). Only the stores change: the base state
++// goes to state slot 0, and k, delta and g of the last tokens go to the journal.
++template <int S_v, bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool JOURNAL, int COLS_PER_WARP = 1>
  __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
  gated_delta_net_cuda(const float * q,
                                       const float * k,
-@@ -21,8 +21,10 @@ gated_delta_net_cuda(const float * q,
+@@ -21,8 +23,10 @@ gated_delta_net_cuda(const float * q,
                                       const float * raw_dt_bias,
                                       const float * raw_a,
                                       const float * curr_state,
@@ -1195,7 +1296,7 @@ index 5cf6968a6..17b844b67 100644
                                       int64_t       H,
                                       int64_t       n_tokens,
                                       int64_t       n_seqs,
-@@ -39,17 +41,20 @@ gated_delta_net_cuda(const float * q,
+@@ -39,17 +43,25 @@ gated_delta_net_cuda(const float * q,
                                       const uint3   rq3_magic,
                                       float         scale,
                                       int64_t       state_slot_stride,
@@ -1205,7 +1306,11 @@ index 5cf6968a6..17b844b67 100644
 +                                     int           snap0,
 +                                     int           snap1,
 +                                     int           snap2,
-+                                     int           snap3) {
++                                     int           snap3,
++                                     float *       journal,
++                                     int           n_journal,
++                                     int64_t       journal_entry,
++                                     int           neqk1) {
      const uint32_t h_idx    = blockIdx.x;
      const uint32_t sequence = blockIdx.y;
      // Each warp owns one or more columns, using warp-level primitives to reduce across rows.
@@ -1219,12 +1324,13 @@ index 5cf6968a6..17b844b67 100644
 +    // The four-column specialization is selected only for long scalar-gate scans.
 +    // It keeps one q/k vector live while updating four independent state columns.
 +    static_assert(COLS_PER_WARP == 1 || (COLS_PER_WARP == 4 && S_v == 128 && !KDA), "bad GDN column group");
++    static_assert(!JOURNAL || (!KDA && !keep_rs_t), "the journal replaces the snapshot slots (scalar gate only)");
 +    const int lane = threadIdx.x;
 +    const int col  = (blockIdx.z * blockDim.y + threadIdx.y) * COLS_PER_WARP;
  
      const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
      const uint32_t iq3 = fastdiv(sequence, rq3_magic);
-@@ -58,21 +63,22 @@ gated_delta_net_cuda(const float * q,
+@@ -58,21 +70,22 @@ gated_delta_net_cuda(const float * q,
  
      // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
      // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
@@ -1252,7 +1358,32 @@ index 5cf6968a6..17b844b67 100644
  #pragma unroll
          for (int r = 0; r < rows_per_lane; r++) {
              const int i = r * warp_size + lane;
-@@ -89,9 +95,22 @@ gated_delta_net_cuda(const float * q,
+@@ -80,6 +93,24 @@ gated_delta_net_cuda(const float * q,
+         }
+     }
+ 
++    // Journal: entries for the last jrnl_c tokens (from jrnl_t0); the base is the
++    // state after token jrnl_t0 - 1, i.e. the input state when every token is journaled.
++    [[maybe_unused]] int jrnl_t0 = 0;
++    if constexpr (JOURNAL) {
++        jrnl_t0 = (int) n_tokens - (int) min((int64_t) n_journal, n_tokens);
++        if (jrnl_t0 == 0) {
++            float * state_out = state + state_out_offset;
++#pragma unroll
++            for (int c = 0; c < COLS_PER_WARP; ++c) {
++#pragma unroll
++                for (int r = 0; r < rows_per_lane; r++) {
++                    const int i = r * warp_size + lane;
++                    state_out[(col + c) * S_v + i] = s_shard[c][r];
++                }
++            }
++        }
++    }
++
+     for (int t = 0; t < n_tokens; t++) {
+         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+@@ -89,9 +120,22 @@ gated_delta_net_cuda(const float * q,
          const float * beta_t = beta + gb_offset;
          const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
  
@@ -1278,8 +1409,26 @@ index 5cf6968a6..17b844b67 100644
          }
  
          // Cache k and q in registers
-@@ -106,16 +125,31 @@ gated_delta_net_cuda(const float * q,
+@@ -104,18 +148,55 @@ gated_delta_net_cuda(const float * q,
+             q_reg[r] = q_t[i];
+         }
  
++        // this token's journal entry: k [S_v, neqk1], delta [S_v, H], g [H]
++        [[maybe_unused]] float * jrnl_e = nullptr;
++        if constexpr (JOURNAL) {
++            if (t >= jrnl_t0) {
++                jrnl_e = journal + ((int64_t) sequence * n_journal + (t - jrnl_t0)) * journal_entry;
++                // k is shared by the v-heads of one k-head; the first ones (iq1 == h_idx) store it
++                if (col == 0 && (int) h_idx < neqk1) {
++#pragma unroll
++                    for (int r = 0; r < rows_per_lane; r++) {
++                        const int i = r * warp_size + lane;
++                        jrnl_e[iq1 * S_v + i] = k_reg[r];
++                    }
++                }
++            }
++        }
++
          if constexpr (!KDA) {
              static_assert(!(RAW && G_PRECOMPUTED), "exp(g) precompute is only defined for activated gates");
 -            float g0 = *g_t;
@@ -1306,6 +1455,12 @@ index 5cf6968a6..17b844b67 100644
 +                    g0 = raw_a[h_idx] * ((x > 20.0f) ? x : logf(1.0f + expf(x)));
 +                }
 +                g_val = G_PRECOMPUTED ? g0 : expf(g0);
++            }
++
++            if constexpr (JOURNAL) {
++                if (jrnl_e != nullptr && col == 0 && lane == 0) {
++                    jrnl_e[(int64_t) (neqk1 + H) * S_v + h_idx] = g_val;
++                }
              }
 -            const float g_val = G_PRECOMPUTED ? g0 : expf(g0);
  
@@ -1316,9 +1471,37 @@ index 5cf6968a6..17b844b67 100644
                  float kv_shard = 0.0f;
  #pragma unroll
                  for (int r = 0; r < rows_per_lane; r++) {
-@@ -172,17 +206,24 @@ gated_delta_net_cuda(const float * q,
+@@ -125,6 +206,12 @@ gated_delta_net_cuda(const float * q,
+ 
+                 float delta_col = (v_t[col + c] - g_val * kv_col) * beta_val;
+ 
++                if constexpr (JOURNAL) {
++                    if (jrnl_e != nullptr && lane == 0) {
++                        jrnl_e[(int64_t) neqk1 * S_v + h_idx * S_v + col + c] = delta_col;
++                    }
++                }
++
+                 float attn_partial = 0.0f;
+ #pragma unroll
+                 for (int r = 0; r < rows_per_lane; r++) {
+@@ -171,18 +258,39 @@ gated_delta_net_cuda(const float * q,
+ 
          attn_data += S_v * H;
  
++        if constexpr (JOURNAL) {
++            if (t == jrnl_t0 - 1) {
++                float * state_out = state + state_out_offset;
++#pragma unroll
++                for (int c = 0; c < COLS_PER_WARP; ++c) {
++#pragma unroll
++                    for (int r = 0; r < rows_per_lane; r++) {
++                        const int i = r * warp_size + lane;
++                        state_out[(col + c) * S_v + i] = s_shard[c][r];
++                    }
++                }
++            }
++        }
++
          if constexpr (keep_rs_t) {
 -            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
 -            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -1347,10 +1530,12 @@ index 5cf6968a6..17b844b67 100644
                      }
                  }
              }
-@@ -191,12 +232,13 @@ gated_delta_net_cuda(const float * q,
+@@ -190,34 +298,43 @@ gated_delta_net_cuda(const float * q,
+ 
      }
  
-     if constexpr (!keep_rs_t) {
+-    if constexpr (!keep_rs_t) {
++    if constexpr (!keep_rs_t && !JOURNAL) {
 +        float * state_out = state + state_out_offset;
  #pragma unroll
 -        for (int c = 0; c < cols_per_warp; ++c) {
@@ -1363,7 +1548,10 @@ index 5cf6968a6..17b844b67 100644
              }
          }
      }
-@@ -206,18 +248,25 @@ template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
+ }
+ 
+-template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED>
++template <bool KDA, bool keep_rs_t, bool RAW, bool G_PRECOMPUTED, bool JOURNAL>
  static void launch_gated_delta_net(
          const float * q_d, const float * k_d, const float * v_d,
          const float * g_d, const float * b_d, const float * rb_d, const float * ra_d, const float * s_d,
@@ -1378,6 +1566,7 @@ index 5cf6968a6..17b844b67 100644
 -        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
 +        float scale, int64_t state_slot_stride, int K,
 +        bool custom_snapshots, int snap0, int snap1, int snap2, int snap3,
++        float * journal_d, int n_journal, int64_t journal_entry,
 +        cudaStream_t stream) {
      //TODO: Add chunked kernel for even faster pre-fill
      const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
@@ -1392,7 +1581,7 @@ index 5cf6968a6..17b844b67 100644
      dim3      grid_dims(H, n_seqs, (S_v + num_warps * cols_per_warp - 1) / (num_warps * cols_per_warp));
      dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
  
-@@ -225,37 +274,35 @@ static void launch_gated_delta_net(
+@@ -225,37 +342,35 @@ static void launch_gated_delta_net(
      const uint3 rq3_magic   = init_fastdiv_values(rq3);
  
      const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
@@ -1400,21 +1589,21 @@ index 5cf6968a6..17b844b67 100644
 +    dst_d, state_d, state_row_stride, H, n_tokens, n_seqs, \
 +    sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, \
 +    neqk1_magic, rq3_magic, scale, state_slot_stride, K, custom_snapshots, \
-+    snap0, snap1, snap2, snap3
++    snap0, snap1, snap2, snap3, journal_d, n_journal, journal_entry, (int) neqk1
      switch (S_v) {
          case 16:
 -            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
 -                q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
 -                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 -                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params, GDN_ARGS);
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, RAW, G_PRECOMPUTED, JOURNAL>, launch_params, GDN_ARGS);
              break;
          case 32:
 -            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
 -                q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, H,
 -                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 -                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
-+            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params, GDN_ARGS);
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, RAW, G_PRECOMPUTED, JOURNAL>, launch_params, GDN_ARGS);
              break;
 -        case 64: {
 -            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params,
@@ -1422,7 +1611,7 @@ index 5cf6968a6..17b844b67 100644
 -                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
 -                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 +        case 64:
-+            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params, GDN_ARGS);
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, RAW, G_PRECOMPUTED, JOURNAL>, launch_params, GDN_ARGS);
              break;
 -        }
 -        case 128: {
@@ -1433,11 +1622,11 @@ index 5cf6968a6..17b844b67 100644
 +        case 128:
 +            if constexpr (!KDA) {
 +                if (group_columns) {
-+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, 4>, launch_params, GDN_ARGS);
++                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, JOURNAL, 4>, launch_params, GDN_ARGS);
 +                    break;
 +                }
 +            }
-+            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED>, launch_params, GDN_ARGS);
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, RAW, G_PRECOMPUTED, JOURNAL>, launch_params, GDN_ARGS);
              break;
 -        }
          default:
@@ -1448,7 +1637,7 @@ index 5cf6968a6..17b844b67 100644
  }
  
  static void ggml_cuda_op_gated_delta_net_impl(
-@@ -296,6 +343,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -296,6 +411,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
      const float * s_d   = (const float *) src_state->data;
      float *       dst_d = (float *) dst->data;
  
@@ -1460,7 +1649,7 @@ index 5cf6968a6..17b844b67 100644
      GGML_ASSERT(ggml_is_contiguous_rows(src_q));
      GGML_ASSERT(ggml_is_contiguous_rows(src_k));
      GGML_ASSERT(ggml_is_contiguous_rows(src_v));
-@@ -304,6 +356,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -304,6 +424,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
      GGML_ASSERT(ggml_is_contiguous(src_g));
      GGML_ASSERT(ggml_is_contiguous(src_beta));
      GGML_ASSERT(ggml_is_contiguous(src_state));
@@ -1471,7 +1660,7 @@ index 5cf6968a6..17b844b67 100644
  
      // strides in floats (beta strides used for both g and beta offset computation)
      const int64_t sq1 = nbq1 / sizeof(float);
-@@ -323,6 +379,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -323,6 +447,13 @@ static void ggml_cuda_op_gated_delta_net_impl(
      // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
      const int K = ggml_get_op_params_i32(dst, 0);
      const bool keep_rs = K > 1;
@@ -1485,7 +1674,7 @@ index 5cf6968a6..17b844b67 100644
  
      // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
      float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
-@@ -330,6 +393,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -330,6 +461,22 @@ static void ggml_cuda_op_gated_delta_net_impl(
      if (cache != nullptr) {
          state_d           = cache->data;
          state_slot_stride = cache->slot_stride;
@@ -1495,28 +1684,155 @@ index 5cf6968a6..17b844b67 100644
 +        state_d           = (float *) src_write_state->data;
 +        state_slot_stride = src_write_state->ne[2] > 1 ?
 +            (int64_t) (src_write_state->nb[2] / sizeof(float)) : 0;
++    }
++
++    // rollback journal: after the attention scores and the base state slot (unless it goes to write_states)
++    const int n_journal = ggml_get_op_params_i32(dst, GGML_GATED_DELTA_NET_JOURNAL_PARAM);
++    float *   journal_d = nullptr;
++    int64_t   journal_entry = 0;
++    if (n_journal > 0) {
++        GGML_ASSERT(!kda && !custom_snapshots && K == 1);
++        journal_d     = dst_d + ggml_gated_delta_net_journal_offset(dst);
++        journal_entry = ggml_gated_delta_net_journal_entry_size(S_v, neqk1, H);
      }
  
      const bool    raw  = ggml_get_op_params_i32(dst, 1) != 0;
-@@ -353,9 +422,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
+@@ -352,20 +499,30 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         g_precomputed = true;
      }
  
- #define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
+-#define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_)                                                       \
 -    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, dst_d, state_d, \
-+    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, \
++#define GDN_LAUNCH(KDA_, KEEP_, RAW_, PRE_, JRNL_)                                                \
++    launch_gated_delta_net<KDA_, KEEP_, RAW_, PRE_, JRNL_>(q_d, k_d, v_d, g_d, b_d, rb_d, ra_d, s_d, \
 +        state_rows_d, dst_d, state_d, state_row_stride, \
          S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                                    \
 -        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream)
 +        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, custom_snapshots, \
-+        snap0, snap1, snap2, snap3, stream)
++        snap0, snap1, snap2, snap3, journal_d, n_journal, journal_entry, stream)
  
      if (kda) {
-         if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }
+-        if (keep_rs) { GDN_LAUNCH(true,  true,  false, false); } else { GDN_LAUNCH(true,  false, false, false); }
++        if (keep_rs) { GDN_LAUNCH(true,  true,  false, false, false); } else { GDN_LAUNCH(true,  false, false, false, false); }
++    } else if (n_journal > 0) {
++        if (raw) {
++            GDN_LAUNCH(false, false, true,  false, true);
++        } else if (g_precomputed) {
++            GDN_LAUNCH(false, false, false, true,  true);
++        } else {
++            GDN_LAUNCH(false, false, false, false, true);
++        }
+     } else if (raw) {
+-        if (keep_rs) { GDN_LAUNCH(false, true,  true,  false); } else { GDN_LAUNCH(false, false, true,  false); }
++        if (keep_rs) { GDN_LAUNCH(false, true,  true,  false, false); } else { GDN_LAUNCH(false, false, true,  false, false); }
+     } else {
+         if (g_precomputed) {
+-            if (keep_rs) { GDN_LAUNCH(false, true,  false, true);  } else { GDN_LAUNCH(false, false, false, true);  }
++            if (keep_rs) { GDN_LAUNCH(false, true,  false, true,  false); } else { GDN_LAUNCH(false, false, false, true,  false); }
+         } else {
+-            if (keep_rs) { GDN_LAUNCH(false, true,  false, false); } else { GDN_LAUNCH(false, false, false, false); }
++            if (keep_rs) { GDN_LAUNCH(false, true,  false, false, false); } else { GDN_LAUNCH(false, false, false, false, false); }
+         }
+     }
+ #undef GDN_LAUNCH
+@@ -379,3 +536,71 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+ }
++
++// Applies journal entries to base states in place (ggml_gated_delta_net_commit).
++// Block (col, h, pair); thread i owns element i of state column col of v-head h.
++// The update must round exactly as gated_delta_net_cuda's `g_val * s + k * delta_col`,
++// which nvcc contracts to fma(g_val, s, k * delta_col). Left to the compiler, the same
++// expression here can contract to fma(k, delta_col, g_val * s), so the form is spelled out.
++static __global__ void gated_delta_net_commit_cuda(
++        float * states, int64_t state_row_stride,
++        const float * journal, int64_t journal_row_stride, int64_t journal_entry,
++        const int32_t * plan, int count, int S_v, int H_k, int H_v) {
++    const int col = blockIdx.x;
++    const int h   = blockIdx.y;
++    const int i   = threadIdx.x;
++
++    int64_t row = 0;
++    int     n   = count;
++    if (plan != nullptr) {
++        row = plan[2 * blockIdx.z];
++        n   = plan[2 * blockIdx.z + 1];
++    }
++    if (n <= 0) {
++        return;
++    }
++
++    // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
++    float * s_col = states + row * state_row_stride + ((int64_t) h * S_v + col) * S_v;
++    const float * jr = journal + row * journal_row_stride;
++    const int hk = h % H_k;
++
++    float s = s_col[i];
++    for (int e = 0; e < n; ++e) {
++        const float * je = jr + e * journal_entry;
++        const float k_i       = je[hk * S_v + i];
++        const float delta_col = je[(int64_t) H_k * S_v + h * S_v + col];
++        const float g_val     = je[(int64_t) (H_k + H_v) * S_v + h];
++        s = __fmaf_rn(g_val, s, __fmul_rn(k_i, delta_col));
++    }
++    s_col[i] = s;
++}
++
++void ggml_cuda_op_gated_delta_net_commit(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src_states  = dst->src[0];
++    const ggml_tensor * src_journal = dst->src[1];
++    const ggml_tensor * src_plan    = dst->src[2];
++
++    const int S_v       = ggml_get_op_params_i32(dst, 0);
++    const int H_k       = ggml_get_op_params_i32(dst, 1);
++    const int H_v       = ggml_get_op_params_i32(dst, 2);
++    const int count     = ggml_get_op_params_i32(dst, 4);
++
++    GGML_ASSERT(dst->data == src_states->data);
++    // one thread per state element of a column: the head sizes the GDN kernel supports
++    GGML_ASSERT(S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128);
++
++    const int64_t n_pairs = src_plan != nullptr ? src_plan->ne[0] / 2 : 1;
++    if (n_pairs == 0) {
++        return;
++    }
++
++    const dim3 grid_dims(S_v, H_v, n_pairs);
++    const dim3 block_dims(S_v, 1, 1);
++
++    gated_delta_net_commit_cuda<<<grid_dims, block_dims, 0, ctx.stream()>>>(
++        (float *) dst->data, (int64_t) (src_states->nb[1] / sizeof(float)),
++        (const float *) src_journal->data, (int64_t) (src_journal->nb[1] / sizeof(float)),
++        ggml_gated_delta_net_journal_entry_size(S_v, H_k, H_v),
++        src_plan != nullptr ? (const int32_t *) src_plan->data : nullptr, count, S_v, H_k, H_v);
++}
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index f9bf43706..009e207bf 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -12,3 +12,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                               ggml_cuda_gated_delta_net_fused_cache cache);
++
++// apply rollback-journal entries to base states in place (ggml_gated_delta_net_commit)
++void ggml_cuda_op_gated_delta_net_commit(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7536a5d2a..e166cdf19 100644
+index 7536a5d2a..b357bf2e6 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3327,7 +3327,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -2380,6 +2380,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_GATED_DELTA_NET:
+             ggml_cuda_op_gated_delta_net(ctx, dst);
+             break;
++        case GGML_OP_GATED_DELTA_NET_COMMIT:
++            ggml_cuda_op_gated_delta_net_commit(ctx, dst);
++            break;
+         case GGML_OP_DSV4_HC_COMB:
+             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
+             break;
+@@ -3327,7 +3330,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
          const ggml_op ops[] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
          const int out_nodes[] = { i, i + 3, i + 4 };
@@ -1527,7 +1843,7 @@ index 7536a5d2a..e166cdf19 100644
                  mul->op == GGML_OP_MUL && mm_a->op == GGML_OP_MUL_MAT && mm_b->op == GGML_OP_MUL_MAT &&
                  mm_a->src[1] == mul && mm_b->src[1] == mul &&
                  (mul->src[0] == rms_norm || mul->src[1] == rms_norm) && rms_norm->src[0] == node &&
-@@ -3340,7 +3342,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3340,7 +3345,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
                  mul->ne[1] >= 32 && mm_a->src[0]->type == mm_b->src[0]->type &&
                  (mm_a->src[0]->type == GGML_TYPE_Q1_0 ||
                   mm_a->src[0]->type == GGML_TYPE_Q2_0 ||
@@ -1537,7 +1853,7 @@ index 7536a5d2a..e166cdf19 100644
                  ggml_cuda_should_use_mmq(mm_a->src[0]->type, cc, mul->ne[1], 0) &&
                  ggml_cuda_should_use_mmq(mm_b->src[0]->type, cc, mul->ne[1], 0) &&
                  ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 3) &&
-@@ -3365,7 +3368,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3365,7 +3371,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
          const ggml_op ops[] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
          const int out_nodes[] = { i, i + 2 };
@@ -1547,7 +1863,7 @@ index 7536a5d2a..e166cdf19 100644
                  mul->op == GGML_OP_MUL && (mul->src[0] == rms_norm || mul->src[1] == rms_norm) &&
                  rms_norm->src[0] == node && node->src[0] && node->src[1] &&
                  node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 &&
-@@ -3475,6 +3479,154 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -3475,6 +3482,154 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -1702,7 +2018,7 @@ index 7536a5d2a..e166cdf19 100644
      // Hadamard sign flip + reshape + FWHT-hint matmul: multiply the sign
      // vector during the transform's load instead of a separate full pass
      if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_RESHAPE, GGML_OP_MUL_MAT }, { i + 2 })) {
-@@ -4153,6 +4305,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4153,6 +4308,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
          ggml_cuda_pool_alloc<char> * data;
          bool quantized = false;
          int remaining = 0;
@@ -1710,7 +2026,7 @@ index 7536a5d2a..e166cdf19 100644
      };
      std::vector<gb10_shared_q8_entry> gb10_shared_q8;
  
-@@ -4167,7 +4320,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4167,7 +4323,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      std::vector<gb10_virtual_rms_entry> gb10_virtual_rms;
      // Keep every persistent pool allocation in true allocation order. The VMM
      // scratch pool is stack-like, so all releases happen globally in reverse.
@@ -1731,7 +2047,7 @@ index 7536a5d2a..e166cdf19 100644
  
      std::map<const ggml_tensor *, std::array<int, GGML_TYPE_COUNT>> gb10_shared_q8_consumer_counts;
      for (int j = 0; j < cgraph->n_nodes; ++j) {
-@@ -4372,7 +4537,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4372,7 +4540,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                          auto row_scale = std::make_unique<ggml_cuda_pool_alloc<char>>(
                              cuda_ctx->pool(), ggml_nrows(node)*sizeof(float));
                          ggml_cuda_pool_alloc<char> * row_scale_ptr = row_scale.get();
@@ -1740,7 +2056,7 @@ index 7536a5d2a..e166cdf19 100644
                          ggml_cuda_op_add_rms_norm_scale_fused(
                              *cuda_ctx, node, rms, (float *) row_scale_ptr->get());
                          gb10_virtual_rms.push_back({ mul, node, weight, consumer_type, row_scale_ptr, consumers });
-@@ -4398,13 +4563,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4398,13 +4566,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  // normalized activation. Quantize it once per graph execution and
                  // reuse the Q8 tile for the later MMQs on the same CUDA stream.
                  const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
@@ -1759,7 +2075,7 @@ index 7536a5d2a..e166cdf19 100644
                          ggml_cuda_should_use_mmq(node->src[0]->type, cc, node->src[1]->ne[1], 0) &&
                          gb10_shared_q8_consumer_count(node->src[1], node->src[0]->type) > 1) {
                      auto virtual_it = std::find_if(gb10_virtual_rms.begin(), gb10_virtual_rms.end(), [&](const auto & entry) {
-@@ -4418,9 +4586,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4418,9 +4589,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                          auto data = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool(),
                                  ggml_cuda_mul_mat_q_q8_size(node->src[0], node->src[1]));
                          ggml_cuda_pool_alloc<char> * data_ptr = data.get();
@@ -1772,7 +2088,7 @@ index 7536a5d2a..e166cdf19 100644
                          it = std::prev(gb10_shared_q8.end());
                      }
                      ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], virtual_rms ? virtual_it->residual : node->src[1],
-@@ -4432,6 +4601,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4432,6 +4604,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      if (virtual_rms) {
                          --virtual_it->remaining;
                      }
@@ -1790,7 +2106,7 @@ index 7536a5d2a..e166cdf19 100644
                      if (!is_concurrent_event_active) {
                          try_launch_concurrent_event(node);
                      }
-@@ -4506,7 +4686,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4506,7 +4689,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
      // The VMM scratch pool is stack-like, so release all persistent allocations
      // explicitly in reverse order across both shared-Q8 and row-scale buffers.
      for (auto it = gb10_pool_allocations.rbegin(); it != gb10_pool_allocations.rend(); ++it) {
@@ -1799,7 +2115,7 @@ index 7536a5d2a..e166cdf19 100644
      }
  }
  
-@@ -5572,15 +5752,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+@@ -5572,16 +5755,33 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
          case GGML_OP_RWKV_WKV7:
              return true;
          case GGML_OP_GATED_DELTA_NET:
@@ -1823,9 +2139,21 @@ index 7536a5d2a..e166cdf19 100644
 +                    (op->src[6] == NULL || op->src[9]->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(op->src[9]))) {
 +                return false;
 +            }
++            // the rollback journal is defined for the scalar gate only
++            if (ggml_get_op_params_i32(op, GGML_GATED_DELTA_NET_JOURNAL_PARAM) > 0 && op->src[3]->ne[0] != 1) {
++                return false;
++            }
              return true;
++#endif // GGML_USE_MUSA
++        case GGML_OP_GATED_DELTA_NET_COMMIT:
++#ifdef GGML_USE_MUSA
++            return false;
++#else
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_I32);
  #endif // GGML_USE_MUSA
          case GGML_OP_DSV4_HC_COMB:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
 diff --git a/ggml/src/ggml-cuda/mmq-config-ampere.cuh b/ggml/src/ggml-cuda/mmq-config-ampere.cuh
 index 9261c67f6..051382f50 100644
 --- a/ggml/src/ggml-cuda/mmq-config-ampere.cuh
@@ -2956,10 +3284,44 @@ index fbbc6314a..1adaf974a 100644
  }
  
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index fa2a9c44f..ed89af92c 100644
+index fa2a9c44f..7ce826e85 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -6423,6 +6423,70 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
+@@ -1095,6 +1095,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "RWKV_WKV7",
+     "SOLVE_TRI",
+     "GATED_DELTA_NET",
++    "GATED_DELTA_NET_COMMIT",
+     "LIGHTNING_INDEXER",
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+@@ -1116,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "rwkv_wkv7(r, w, k, v, a, b, s)",
+     "A X = B, A triangular, solve X",
+     "gated_delta_net(q, k, v, g, beta, s)",
++    "gated_delta_net_commit(s, journal, plan)",
+     "lightning_indexer(q, k, weights, mask)",
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+@@ -1231,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6423,6 +6425,70 @@ struct ggml_tensor * ggml_gated_delta_net_rows(
      return result;
  }
  
@@ -3030,7 +3392,7 @@ index fa2a9c44f..ed89af92c 100644
  void ggml_gated_delta_net_set_raw_gates(
          struct ggml_tensor  * gdn,
          struct ggml_tensor  * dt_bias,
-@@ -6441,6 +6505,26 @@ void ggml_gated_delta_net_set_raw_gates(
+@@ -6441,6 +6507,192 @@ void ggml_gated_delta_net_set_raw_gates(
      gdn->src[8] = a;
  }
  
@@ -3052,6 +3414,172 @@ index fa2a9c44f..ed89af92c 100644
 +        ggml_set_op_params_i32(gdn, 2 + i, -1);
 +    }
 +    ggml_set_op_params_i32(gdn, 2 + GGML_GATED_DELTA_NET_MAX_SNAPSHOT_PLANES, 1);
++}
++
++int64_t ggml_gated_delta_net_journal_entry_size(int64_t S_v, int64_t H_k, int64_t H_v) {
++    return S_v * H_k + S_v * H_v + H_v;
++}
++
++// Shared by the two journal constructors: the arguments are checked as in
++// ggml_gated_delta_net / ggml_gated_delta_net_rows_commit with K = 1.
++static struct ggml_tensor * ggml_gated_delta_net_journal_impl(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * states,
++        struct ggml_tensor  * read_rows,
++        struct ggml_tensor  * write_states,
++        int                   n_journal) {
++    GGML_ASSERT(ggml_is_contiguous_rows(q));
++    GGML_ASSERT(ggml_is_contiguous_rows(k));
++    GGML_ASSERT(ggml_is_contiguous_rows(v));
++    GGML_ASSERT(ggml_is_contiguous(g));
++    GGML_ASSERT(ggml_is_contiguous(beta));
++    GGML_ASSERT(ggml_is_contiguous(states));
++
++    GGML_ASSERT(q->type == GGML_TYPE_F32);
++    GGML_ASSERT(k->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type == GGML_TYPE_F32);
++    GGML_ASSERT(g->type == GGML_TYPE_F32);
++    GGML_ASSERT(beta->type == GGML_TYPE_F32);
++    GGML_ASSERT(states->type == GGML_TYPE_F32);
++
++    const int64_t S_v      = v->ne[0];
++    const int64_t H        = v->ne[1];
++    const int64_t n_tokens = v->ne[2];
++    const int64_t n_seqs   = v->ne[3];
++
++    GGML_ASSERT(n_journal >= 1);
++    GGML_ASSERT(g->ne[0] == 1); // scalar gate only
++    GGML_ASSERT(beta->ne[0] == 1);
++    GGML_ASSERT(k->ne[0] == S_v && H % k->ne[1] == 0);
++
++    int64_t state_rows = 0;
++    if (read_rows == NULL) {
++        // gathered input state [S_v, S_v, H, n_seqs]; the base state is one slot of the output
++        GGML_ASSERT(states->ne[0] == S_v && states->ne[1] == S_v && states->ne[2] == H && states->ne[3] == n_seqs);
++        state_rows = S_v * n_seqs;
++    } else {
++        GGML_ASSERT(ggml_is_contiguous(read_rows));
++        GGML_ASSERT(read_rows->type == GGML_TYPE_I32);
++        GGML_ASSERT(write_states != NULL && write_states->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous_rows(write_states));
++        GGML_ASSERT(states->ne[0] == S_v * S_v * H);
++        GGML_ASSERT(read_rows->ne[0] == n_seqs);
++        GGML_ASSERT(write_states->ne[0] == S_v * S_v * H);
++        GGML_ASSERT(write_states->ne[1] == n_seqs);
++        GGML_ASSERT(write_states->ne[2] == 1);
++    }
++
++    // journal floats, padded to whole rows of width S_v*H
++    const int64_t n_jrnl = (int64_t) n_journal * ggml_gated_delta_net_journal_entry_size(S_v, k->ne[1], H) * n_seqs;
++    const int64_t journal_rows = (n_jrnl + S_v * H - 1) / (S_v * H);
++
++    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows + journal_rows, 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    ggml_set_op_params_i32(result, 0, 1); // K: the base state is the only state slot
++    ggml_set_op_params_i32(result, GGML_GATED_DELTA_NET_JOURNAL_PARAM, n_journal);
++
++    result->op     = GGML_OP_GATED_DELTA_NET;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = v;
++    result->src[3] = g;
++    result->src[4] = beta;
++    result->src[5] = states;
++    result->src[6] = read_rows;
++    result->src[9] = write_states;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_gated_delta_net_journal(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * state,
++        int                   n_journal) {
++    return ggml_gated_delta_net_journal_impl(ctx, q, k, v, g, beta, state, NULL, NULL, n_journal);
++}
++
++struct ggml_tensor * ggml_gated_delta_net_rows_commit_journal(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * states,
++        struct ggml_tensor  * read_rows,
++        struct ggml_tensor  * write_states,
++        int                   n_journal) {
++    GGML_ASSERT(read_rows != NULL);
++    return ggml_gated_delta_net_journal_impl(ctx, q, k, v, g, beta, states, read_rows, write_states, n_journal);
++}
++
++size_t ggml_gated_delta_net_journal_offset(const struct ggml_tensor * gdn) {
++    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
++    GGML_ASSERT(ggml_get_op_params_i32(gdn, GGML_GATED_DELTA_NET_JOURNAL_PARAM) > 0);
++
++    const struct ggml_tensor * v = gdn->src[2];
++    const int64_t S_v      = v->ne[0];
++    const int64_t H        = v->ne[1];
++    const int64_t n_tokens = v->ne[2];
++    const int64_t n_seqs   = v->ne[3];
++    const int64_t K        = ggml_get_op_params_i32(gdn, 0);
++
++    // attention scores, then the state slots unless they go to write_states (src[9])
++    const int64_t state_tail = gdn->src[9] != NULL ? 0 : K * S_v * S_v * H * n_seqs;
++    return (size_t) (S_v * H * n_tokens * n_seqs + state_tail);
++}
++
++struct ggml_tensor * ggml_gated_delta_net_commit(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * states,
++        struct ggml_tensor  * journal,
++        struct ggml_tensor  * plan,
++        int64_t               S_v,
++        int64_t               H_k,
++        int64_t               H_v,
++        int                   n_journal,
++        int                   count) {
++    GGML_ASSERT(states->type == GGML_TYPE_F32);
++    GGML_ASSERT(journal->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous_rows(states));
++    GGML_ASSERT(ggml_is_contiguous_rows(journal));
++    GGML_ASSERT(states->ne[0] == S_v * S_v * H_v);
++    GGML_ASSERT(journal->ne[0] == n_journal * ggml_gated_delta_net_journal_entry_size(S_v, H_k, H_v));
++    GGML_ASSERT(n_journal >= 1 && H_v % H_k == 0);
++    GGML_ASSERT(plan == NULL || (plan->type == GGML_TYPE_I32 && ggml_is_contiguous(plan) && plan->ne[0] % 2 == 0));
++    GGML_ASSERT(plan != NULL || (count >= 0 && count <= n_journal));
++
++    struct ggml_tensor * result = ggml_view_tensor(ctx, states);
++
++    ggml_set_op_params_i32(result, 0, (int32_t) S_v);
++    ggml_set_op_params_i32(result, 1, (int32_t) H_k);
++    ggml_set_op_params_i32(result, 2, (int32_t) H_v);
++    ggml_set_op_params_i32(result, 3, n_journal);
++    ggml_set_op_params_i32(result, 4, count);
++
++    result->op     = GGML_OP_GATED_DELTA_NET_COMMIT;
++    result->src[0] = states;
++    result->src[1] = journal;
++    result->src[2] = plan;
++
++    return result;
++}
++
++void ggml_gated_delta_net_commit_set_count(struct ggml_tensor * commit, int count) {
++    GGML_ASSERT(commit->op == GGML_OP_GATED_DELTA_NET_COMMIT && commit->src[2] == NULL);
++    GGML_ASSERT(count >= 0 && count <= ggml_get_op_params_i32(commit, 3));
++    ggml_set_op_params_i32(commit, 4, count);
 +}
 +
  // ggml_lightning_indexer
@@ -3153,7 +3681,7 @@ index 2b7172e8f..bba20e963 100644
  bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 +bool llm_arch_supports_rs_snapshots(const llm_arch & arch);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 2c8fbd905..a14b31eab 100644
+index 2c8fbd905..206c1ea40 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -24,6 +24,16 @@
@@ -3189,7 +3717,42 @@ index 2c8fbd905..a14b31eab 100644
  
      if (cparams.n_ctx_seq < hparams.n_ctx_train) {
          LLAMA_LOG_INFO("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
-@@ -1285,6 +1297,20 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
+@@ -470,6 +482,15 @@ llama_context::llama_context(
+ 
+         memory.reset(model.create_memory(params_mem, cparams));
+ 
++        // a state save commits the rollback journal on the context's backends
++        if (auto * recurrent = llama_get_recurrent_memory(memory.get()); recurrent != nullptr && recurrent->journal) {
++            std::vector<ggml_backend_t> journal_backends;
++            for (const auto & backend : backends) {
++                journal_backends.push_back(backend.get());
++            }
++            recurrent->journal_set_backends(journal_backends);
++        }
++
+         if (params.path_kv_mean_center != nullptr) {
+             // collect every standard llama_kv_cache the memory module keeps for attention
+             // layers. hybrid (recurrent + attention) models keep one for their attention
+@@ -763,6 +784,18 @@ void llama_context::sched_reserve() {
+         n_nodes_tg  = ggml_graph_n_nodes(gf);
+     }
+ 
++    // journal: an in-pass snapshot ubatch (one sequence) builds the K-slot GDN
++    // output that no other graph has; reserve it so the buffer is sized at init
++    if (auto * recurrent = llama_get_recurrent_memory(memory.get());
++            recurrent != nullptr && recurrent->journal && n_state_snapshots() > 0) {
++        recurrent->journal_reserve_snapshot = true;
++        auto * gf = graph_reserve(n_tokens, 1, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
++        recurrent->journal_reserve_snapshot = false;
++        if (!gf) {
++            throw std::runtime_error("failed to allocate compute buffers for in-pass snapshots");
++        }
++    }
++
+     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+     {
+         // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
+@@ -1285,6 +1318,20 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
      cparams.nextn_layer_offset = offset;
  }
  
@@ -3210,7 +3773,7 @@ index 2c8fbd905..a14b31eab 100644
  void llama_context::set_causal_attn(bool value) {
      LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
  
-@@ -1483,6 +1509,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1483,6 +1530,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
          res->set_inputs(&ubatch);
  
@@ -3259,7 +3822,7 @@ index 2c8fbd905..a14b31eab 100644
          //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
      }
  
-@@ -1741,11 +1809,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1741,11 +1830,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
      // so accept either present rather than requiring exactly one.
      GGML_ASSERT(batch_inp.token || batch_inp.embd);
  
@@ -3280,20 +3843,62 @@ index 2c8fbd905..a14b31eab 100644
 +    // A selected snapshot plane must never become the input state of a decode.
 +    release_state_snapshot();
 +
++    // Snapshot buffers of an earlier decode are no longer selectable.
++    state_staging_release(-1, true);
++
 +    // A snapshot request covers exactly one decode; consume it on every exit path.
++    // Its snapshot buffers now hold this decode's snapshots (or nothing).
 +    struct state_snapshot_request_guard {
++        llama_context * ctx;
 +        llama_memory_recurrent * mem;
 +        ~state_snapshot_request_guard() {
 +            if (mem != nullptr) {
 +                mem->clear_state_snapshot_requests();
 +            }
++            for (auto & st : ctx->state_stagings) {
++                st.filled = true;
++            }
 +        }
-+    } snapshot_request_guard { llama_get_recurrent_memory(memory.get()) };
++    } snapshot_request_guard { this, llama_get_recurrent_memory(memory.get()) };
 +
      if (batch_inp.n_tokens == 0) {
          LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
          return -1;
-@@ -3079,6 +3169,61 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
+@@ -1920,6 +2039,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
+         if (!res) {
++            // journal: the recurrent state of the ubatch's sequences is undefined now
++            if (auto * recurrent = llama_get_recurrent_memory(memory.get()); recurrent != nullptr) {
++                recurrent->journal_ubatch_failed(ubatch);
++            }
++
+             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+             llama_pos pos_min[LLAMA_MAX_SEQ];
+             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+@@ -2665,6 +2789,10 @@ public:
+         return size_written;
+     }
+ 
++    bool stores_tensor_data() const override {
++        return false;
++    }
++
+ private:
+     const bool skip_tensors;
+ 
+@@ -2938,6 +3066,10 @@ public:
+         winfos.push_back({tensor, ptr, size, offset});
+     }
+ 
++    bool tensor_writes_immediate() const override {
++        return false;
++    }
++
+     size_t n_bytes() override {
+         return size_written;
+     }
+@@ -3079,6 +3211,311 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
  
  static constexpr uint32_t io_magic = 0xaf143cd8;
  
@@ -3325,7 +3930,257 @@ index 2c8fbd905..a14b31eab 100644
 +        recurrent->set_state_snapshots(seq_id, nullptr, 0);
 +        return;
 +    }
-+    recurrent->set_state_snapshots(seq_id, positions, count);
++    if (!recurrent->journal) {
++        recurrent->set_state_snapshots(seq_id, positions, count);
++        return;
++    }
++
++    // Journal: the snapshots go to checkpoint buffers instead of rollback planes.
++    // Buffers of an earlier decode, and an earlier request of this sequence, end here.
++    state_staging_release(-1, true);
++    state_staging_release(seq_id, false);
++
++    const size_t n_req = positions != nullptr ? std::min<size_t>(count, n_state_snapshots()) : 0;
++    std::vector<llama_memory_recurrent::state_snapshot_dst> dsts;
++    for (size_t i = 0; i < n_req; ++i) {
++        state_staging st;
++        st.seq_id = seq_id;
++        st.slot   = (uint32_t) i;
++        llama_memory_recurrent::state_snapshot_dst dst;
++        if (!state_staging_make(recurrent, seq_id, st.bufs, dst)) {
++            // only the positions with a buffer are requested
++            LLAMA_LOG_WARN("%s: no device memory for in-pass snapshot %zu of seq %d; it is not captured\n",
++                    __func__, i, seq_id);
++            break;
++        }
++        state_stagings.push_back(std::move(st));
++        dsts.push_back(std::move(dst));
++    }
++
++    const size_t n_dst = dsts.size();
++    recurrent->set_state_snapshot_dsts(seq_id, std::move(dsts));
++    recurrent->set_state_snapshots(seq_id, n_dst > 0 ? positions : nullptr, n_dst);
++}
++
++bool llama_context::state_staging_make(llama_memory_recurrent * mem, llama_seq_id seq_id,
++        llama_memory_buffers & bufs, llama_memory_recurrent::state_snapshot_dst & dst) {
++    // The layout a device checkpoint of one cell gets from llama_io_write_device:
++    // per buffer type, the R rows of every layer, then the S rows, as 1D copies.
++    const int32_t n_layer = (int32_t) mem->r_l.size();
++    const int32_t tail = seq_id >= 0 && (uint32_t) seq_id < mem->size ? mem->cells[seq_id].tail : -1;
++    const size_t  cell = tail >= 0 ? (size_t) tail : 0;
++
++    dst.r.assign(n_layer, nullptr);
++    dst.s.assign(n_layer, nullptr);
++
++    llama_memory_buffers layout;
++    struct entry { ggml_tensor * t; size_t offs; size_t size; bool is_r; int32_t il; };
++    std::vector<entry> entries;
++    for (int32_t il = 0; il < n_layer; ++il) {
++        if (mem->r_l[il] != nullptr) {
++            entries.push_back({ mem->r_l[il], cell*mem->r_l[il]->nb[1], mem->r_l[il]->nb[1], true, il });
++        }
++    }
++    for (int32_t il = 0; il < n_layer; ++il) {
++        if (mem->s_l[il] != nullptr) {
++            entries.push_back({ mem->s_l[il], cell*mem->s_l[il]->nb[1], mem->s_l[il]->nb[1], false, il });
++        }
++    }
++    for (const auto & e : entries) {
++        auto & mbuf = layout[ggml_backend_buffer_get_type(e.t->buffer)];
++        mbuf.n_tensors++;
++        mbuf.total_size += e.size;
++    }
++
++    // A free pool entry with this layout lends its buffer.
++    for (const llama_seq_id id : device_state_free) {
++        auto & cand = mem_storage[id];
++        bool same = cand.size() == layout.size();
++        for (auto it = layout.begin(); same && it != layout.end(); ++it) {
++            const auto c = cand.find(it->first);
++            same = c != cand.end() && c->second.buf && c->second.n_tensors == it->second.n_tensors &&
++                c->second.total_size == it->second.total_size && (int) c->second.cpy.size() == it->second.n_tensors;
++        }
++        if (!same) {
++            continue;
++        }
++        // cpy tensors are in write order, so they map to the entries one to one
++        std::map<ggml_backend_buffer_type_t, size_t> next;
++        for (const auto & e : entries) {
++            auto & mbuf = cand[ggml_backend_buffer_get_type(e.t->buffer)];
++            ggml_tensor * t = mbuf.cpy[next[ggml_backend_buffer_get_type(e.t->buffer)]++];
++            if (ggml_nbytes(t) != e.size) {
++                same = false;
++                break;
++            }
++            (e.is_r ? dst.r : dst.s)[e.il] = t;
++        }
++        if (!same) {
++            dst.r.assign(n_layer, nullptr);
++            dst.s.assign(n_layer, nullptr);
++            continue;
++        }
++        bufs = std::move(cand);
++        cand.clear();
++        return true;
++    }
++
++    // Otherwise a new buffer, built as llama_io_write_device builds one.
++    for (auto & [buft, mbuf] : layout) {
++        ggml_init_params params = {
++            /*.mem_size   =*/ 2*mbuf.n_tensors*ggml_tensor_overhead(),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        mbuf.ctx.reset(ggml_init(params));
++        mbuf.org.reserve(mbuf.n_tensors);
++        mbuf.cpy.reserve(mbuf.n_tensors);
++    }
++    for (const auto & e : entries) {
++        auto & mbuf = layout[ggml_backend_buffer_get_type(e.t->buffer)];
++        const int64_t n = e.size/ggml_element_size(e.t);
++        mbuf.org.push_back(ggml_view_1d      (mbuf.ctx.get(), e.t, n, e.offs));
++        mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), e.t->type, n));
++        (e.is_r ? dst.r : dst.s)[e.il] = mbuf.cpy.back();
++    }
++    for (auto & [buft, mbuf] : layout) {
++        mbuf.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(mbuf.ctx.get(), buft));
++        if (!mbuf.buf) {
++            dst.r.clear();
++            dst.s.clear();
++            return false;
++        }
++    }
++    bufs = std::move(layout);
++    return true;
++}
++
++void llama_context::state_staging_release(llama_seq_id seq_id, bool filled_only) {
++    auto * recurrent = llama_get_recurrent_memory(memory.get());
++    for (auto it = state_stagings.begin(); it != state_stagings.end();) {
++        if ((seq_id >= 0 && it->seq_id != seq_id) || (filled_only && !it->filled)) {
++            ++it;
++            continue;
++        }
++        if (recurrent != nullptr) {
++            recurrent->clear_state_snapshot_dsts(it->seq_id);
++        }
++        // a pool entry left without a buffer takes it back; otherwise it is freed
++        if (!it->bufs.empty()) {
++            for (const llama_seq_id id : device_state_free) {
++                auto & cand = mem_storage[id];
++                if (cand.empty()) {
++                    cand = std::move(it->bufs);
++                    break;
++                }
++            }
++        }
++        it = state_stagings.erase(it);
++    }
++}
++
++size_t llama_context::state_seq_adopt_staging(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
++    auto * recurrent = llama_get_recurrent_memory(memory.get());
++    const int32_t slot = recurrent->selected_snapshot_dst(seq_id);
++
++    auto st = std::find_if(state_stagings.begin(), state_stagings.end(), [&](const state_staging & cur) {
++        return cur.seq_id == seq_id && (int32_t) cur.slot == slot;
++    });
++    GGML_ASSERT(st != state_stagings.end() && st->filled);
++
++    // the same pool decision as state_seq_get_data
++    llama_seq_id storage_id;
++    bool reuse_device_slot = false;
++    if (!device_state_free.empty()) {
++        storage_id = *device_state_free.begin();
++        device_state_free.erase(device_state_free.begin());
++        reuse_device_slot = true;
++    } else if (mem_storage.size() >= cparams.n_state_device_max) {
++        LLAMA_LOG_DEBUG("%s: device checkpoint pool is full (%zu slots)\n", __func__, mem_storage.size());
++        return 0;
++    } else {
++        storage_id = next_device_state_id++;
++        if (next_device_state_id >= 0) {
++            next_device_state_id = std::numeric_limits<llama_seq_id>::min();
++        }
++    }
++
++    // The serialized header and metadata are those of a device save; the tensor
++    // records must be exactly the snapshot buffer's tensors.
++    class llama_io_write_meta : public llama_io_write_i {
++    public:
++        llama_io_write_meta(uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
++
++        void write(const void * src, size_t n) override {
++            if (n > buf_size) {
++                throw std::runtime_error("unexpectedly reached end of buffer");
++            }
++            memcpy(ptr, src, n);
++            ptr += n;
++            size_written += n;
++            buf_size -= n;
++        }
++
++        void write_tensor(ggml_tensor * tensor, size_t offset, size_t n) override {
++            if (offset != 0 || n != ggml_nbytes(tensor)) {
++                throw std::runtime_error("in-pass snapshot record is not a whole buffer tensor");
++            }
++            tensors.push_back(tensor);
++        }
++
++        size_t n_bytes() override {
++            return size_written;
++        }
++
++        bool tensor_writes_immediate() const override {
++            return false;
++        }
++
++        std::vector<ggml_tensor *> tensors;
++
++    private:
++        uint8_t * ptr;
++        size_t buf_size;
++        size_t size_written = 0;
++    };
++
++    try {
++        llama_io_write_meta io(dst, size);
++        io.write(&io_magic, sizeof(io_magic));
++        io.write(&storage_id, sizeof(storage_id));
++
++        const size_t result = state_seq_write_data(io, seq_id, flags);
++
++        // a restore copies the buffer's tensors to the records by position, per buffer type
++        std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> got;
++        for (ggml_tensor * t : io.tensors) {
++            got[ggml_backend_buffer_get_type(t->buffer)].push_back(t);
++        }
++        bool match = got.size() == st->bufs.size();
++        for (const auto & [buft, mbuf] : st->bufs) {
++            const auto it = got.find(buft);
++            match = match && it != got.end() && it->second == mbuf.cpy;
++        }
++        if (!match) {
++            throw std::runtime_error("in-pass snapshot records do not match its buffer");
++        }
++
++        // the entry takes the snapshot buffer; its previous buffer (if any) is released with the staging
++        std::swap(mem_storage[storage_id], st->bufs);
++        recurrent->clear_state_snapshot_dst(seq_id, (uint32_t) slot);
++
++        release_state_snapshot();
++        return result;
++    } catch (const std::exception & err) {
++        release_state_snapshot();
++        if (reuse_device_slot) {
++            device_state_free.insert(storage_id);
++        } else {
++            mem_storage.erase(storage_id);
++        }
++        LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
++        return 0;
++    }
 +}
 +
 +bool llama_context::select_state_snapshot(llama_seq_id seq_id, uint32_t index, llama_pos pos) {
@@ -3355,11 +4210,17 @@ index 2c8fbd905..a14b31eab 100644
  size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
      llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
      try {
-@@ -3093,19 +3238,54 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
+@@ -3093,19 +3530,71 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
  }
  
  size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
 +    const bool on_device = flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
++
++    // journal: a selected in-pass snapshot already sits in a checkpoint buffer
++    auto * recurrent = llama_get_recurrent_memory(memory.get());
++    if (on_device && recurrent != nullptr && recurrent->journal && recurrent->selected_snapshot_dst(seq_id) >= 0) {
++        return state_seq_adopt_staging(seq_id, dst, size, flags);
++    }
 +
 +    // A checkpoint must name the immutable copy it just created, not the live
 +    // sequence that created it. With one copy per sequence, every later
@@ -3397,12 +4258,23 @@ index 2c8fbd905..a14b31eab 100644
          io->write(&io_magic, sizeof(io_magic));
 -        io->write(&seq_id, sizeof(seq_id));
 +        io->write(&storage_id, sizeof(storage_id));
++
++        const size_t result = state_seq_write_data(*io, seq_id, flags);
  
 -        return state_seq_write_data(*io, seq_id, flags);
-+        const size_t result = state_seq_write_data(*io, seq_id, flags);
++        // a device save copies when its io ends; journal entries are then
++        // applied to the copied base rows
++        io.reset();
++        if (on_device && recurrent != nullptr && recurrent->journal) {
++            for (const auto & [buft, mbuf] : mem_storage[storage_id]) {
++                recurrent->journal_commit_copies(seq_id, mbuf.org, mbuf.cpy);
++            }
++        }
++
 +        release_state_snapshot();
 +        return result;
      } catch (const std::exception & err) {
++        io.reset();
 +        release_state_snapshot();
 +        if (on_device) {
 +            if (reuse_device_slot) {
@@ -3414,7 +4286,7 @@ index 2c8fbd905..a14b31eab 100644
          LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
          return 0;
      }
-@@ -3126,9 +3306,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3126,9 +3615,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
          llama_seq_id seq_id_read;
          io->read(&seq_id_read, sizeof(seq_id_read));
  
@@ -3429,7 +4301,7 @@ index 2c8fbd905..a14b31eab 100644
      } else {
          io = std::make_unique<llama_io_read_host>(src, size);
      }
-@@ -3150,6 +3333,23 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
+@@ -3150,6 +3642,23 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
      }
  }
  
@@ -3453,7 +4325,7 @@ index 2c8fbd905..a14b31eab 100644
  bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
      llama_file file(filepath, "rb");
  
-@@ -3381,6 +3581,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
+@@ -3381,6 +3890,15 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
              ret[buft].context += size;
          }
      }
@@ -3469,7 +4341,7 @@ index 2c8fbd905..a14b31eab 100644
      if (model.hparams.no_alloc) {
          for (size_t i = 0; i < backends.size(); ++i) {
              ggml_backend_t             backend = backends[i].get();
-@@ -3628,6 +3837,7 @@ llama_context_params llama_context_default_params() {
+@@ -3628,6 +4146,7 @@ llama_context_params llama_context_default_params() {
          /*.n_rs_seq                    =*/ 0,
          /*.n_outputs_max               =*/ 0,
          /*.n_outputs_max_per_seq       =*/ 1,
@@ -3477,7 +4349,7 @@ index 2c8fbd905..a14b31eab 100644
          /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
          /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
          /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,
-@@ -3903,6 +4113,22 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+@@ -3903,6 +4422,22 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
      ctx->set_nextn_layer_offset(offset);
  }
  
@@ -3500,7 +4372,7 @@ index 2c8fbd905..a14b31eab 100644
  llama_memory_t llama_get_memory(const struct llama_context * ctx) {
      if (!ctx) {
          return nullptr;
-@@ -4212,6 +4438,28 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
+@@ -4212,6 +4747,28 @@ size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, si
      return ctx->state_seq_set_data(seq_id, src, size, flags);
  }
  
@@ -3530,10 +4402,15 @@ index 2c8fbd905..a14b31eab 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index e2eb74de3..b30fe4a1e 100644
+index e2eb74de3..ca38a646a 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -11,7 +11,9 @@
+@@ -7,11 +7,14 @@
+ #include "llama-adapter.h"
+ #include "llama-impl.h"
+ #include "llama-memory.h"
++#include "llama-memory-recurrent.h"
+ 
  #include "ggml-cpp.h"
  #include "ggml-opt.h"
  
@@ -3543,7 +4420,7 @@ index e2eb74de3..b30fe4a1e 100644
  #include <vector>
  
  struct llama_model;
-@@ -19,6 +21,7 @@ class llama_batch_allocr;
+@@ -19,6 +22,7 @@ class llama_batch_allocr;
  
  class llama_io_read_i;
  class llama_io_write_i;
@@ -3551,7 +4428,7 @@ index e2eb74de3..b30fe4a1e 100644
  
  // "memory" as in abstract memory for the context
  struct llama_memory_i;
-@@ -116,6 +119,9 @@ struct llama_context {
+@@ -116,6 +120,9 @@ struct llama_context {
      void set_embeddings_nextn(bool value, bool masked);
      void set_embeddings_layer_inp(uint32_t lid, bool enable);
      void set_nextn_layer_offset(int32_t offset);
@@ -3561,7 +4438,7 @@ index e2eb74de3..b30fe4a1e 100644
      void set_causal_attn(bool value);
      void set_warmup(bool value);
  
-@@ -155,6 +161,12 @@ struct llama_context {
+@@ -155,6 +162,18 @@ struct llama_context {
  
      size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
      size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
@@ -3571,10 +4448,16 @@ index e2eb74de3..b30fe4a1e 100644
 +    void set_state_snapshots(llama_seq_id seq_id, const llama_pos * positions, size_t count);
 +    bool select_state_snapshot(llama_seq_id seq_id, uint32_t index, llama_pos pos);
 +    void release_state_snapshot();
++
++    // rollback-journal mode: in-pass snapshot buffers (state_stagings)
++    void state_staging_release(llama_seq_id seq_id, bool filled_only);
++    bool state_staging_make(llama_memory_recurrent * mem, llama_seq_id seq_id, llama_memory_buffers & bufs,
++            llama_memory_recurrent::state_snapshot_dst & dst);
++    size_t state_seq_adopt_staging(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags);
  
      bool state_load_file(
              const char * filepath,
-@@ -367,14 +379,33 @@ private:
+@@ -367,14 +386,47 @@ private:
      llm_graph_result_ptr gf_res_prev;
      llm_graph_result_ptr gf_res_reserve;
  
@@ -3602,6 +4485,20 @@ index e2eb74de3..b30fe4a1e 100644
      std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 +    std::set<llama_seq_id> device_state_free;
 +    llama_seq_id next_device_state_id = std::numeric_limits<llama_seq_id>::min();
++
++    // Rollback-journal mode: one buffer per requested in-pass snapshot, laid out
++    // like a device checkpoint of the sequence. The decode writes the snapshot
++    // into it; a device checkpoint of the selected snapshot takes the buffer
++    // over (state_seq_adopt_staging), a host checkpoint copies from it. Buffers
++    // come from free pool entries first (leaving the entry without a buffer)
++    // and go back to such entries when released, else they are freed.
++    struct state_staging {
++        llama_seq_id seq_id = -1;
++        uint32_t     slot   = 0;
++        bool         filled = false; // a decode has run since the request
++        llama_memory_buffers bufs;
++    };
++    std::vector<state_staging> state_stagings;
 +
 +    llama_memory_recurrent * selected_snapshot_mem = nullptr;
 +    llama_seq_id selected_snapshot_seq = -1;
@@ -3652,10 +4549,30 @@ index f1d9800a7..28ac3b569 100644
  // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
  LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index f7c14f573..9b74a3631 100644
+index f7c14f573..a60ae1a7f 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -383,6 +383,10 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
+@@ -354,6 +354,19 @@ void llm_graph_input_rs::set_input_rs(const llama_memory_recurrent_context * mct
+         }
+     }
+ 
++    if (s_copy_base) {
++        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy_base->buffer));
++        GGML_ASSERT(ggml_backend_buffer_is_host(s_journal_plan->buffer));
++        int32_t * rows = (int32_t *) s_copy_base->data;
++        int32_t * plan = (int32_t *) s_journal_plan->data;
++
++        for (uint32_t i = 0; i < n_rs; ++i) {
++            rows[i]         = mctx_cur->s_copy_base(i);
++            plan[2*i + 0]   = mctx_cur->journal_plan_row(i);
++            plan[2*i + 1]   = mctx_cur->journal_plan_count(i);
++        }
++    }
++
+     if (s_write_rows) {
+         GGML_ASSERT(ggml_backend_buffer_is_host(s_write_rows->buffer));
+         int64_t * data = (int64_t *) s_write_rows->data;
+@@ -383,6 +396,10 @@ bool llm_graph_input_rs::can_reuse_rs(const llama_memory_recurrent_context * mct
              std::min<int64_t>(params.ubatch.n_seq_tokens, s_write_K) * params.ubatch.n_seqs;
      }
  
@@ -3666,20 +4583,73 @@ index f7c14f573..9b74a3631 100644
      res &= head == mctx_cur->get_head();
      res &= rs_z == mctx_cur->get_rs_z();
  
-@@ -3532,6 +3536,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -3532,6 +3549,21 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
  
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
 +    inp->custom_snapshots = mctx_cur->has_state_snapshots();
 +    inp->snapshot_indices = mctx_cur->state_snapshot_indices(ubatch);
++
++    if (mctx_cur->journal_enabled()) {
++        inp->s_copy_base = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
++        ggml_set_input(inp->s_copy_base);
++
++        inp->s_copy_base_main  = ggml_view_1d(ctx0, inp->s_copy_base, n_seqs, 0);
++        inp->s_copy_base_extra = ggml_view_1d(ctx0, inp->s_copy_base, n_rs - n_seqs, n_seqs * inp->s_copy_base->nb[0]);
++
++        inp->s_journal_plan = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 2*n_rs);
++        ggml_set_input(inp->s_journal_plan);
++
++        inp->snapshot_request = mctx_cur->has_state_snapshot_request(ubatch);
++    }
  
      return inp;
  }
+@@ -3549,10 +3581,14 @@ ggml_tensor * llm_graph_context::build_rs(
+         ggml_tensor * s,
+             int32_t   state_size,
+             int32_t   n_seqs,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++               bool   base_rows) const {
+     const auto * kv_state = inp->mctx;
+ 
+-    return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
++    GGML_ASSERT(!base_rows || inp->s_copy_base != nullptr);
++    return build_rs(s,
++                    base_rows ? inp->s_copy_base_main  : inp->s_copy_main,
++                    base_rows ? inp->s_copy_base_extra : inp->s_copy_extra, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+                     get_state_rows);
+ }
+@@ -3561,9 +3597,12 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
+         llm_graph_input_rs * inp,
+         ggml_tensor * s,
+             int32_t   state_size,
+-            int32_t   n_seqs) const {
++            int32_t   n_seqs,
++               bool   base_rows) const {
+     const auto * kv_state = inp->mctx;
+ 
++    GGML_ASSERT(!base_rows || inp->s_copy_base != nullptr);
++
+     const uint32_t n_rs     = kv_state->get_n_rs();
+     const uint32_t rs_head  = kv_state->get_head();
+     const  int32_t rs_zero  = kv_state->get_rs_z();
+@@ -3586,7 +3625,7 @@ ggml_tensor * llm_graph_context::build_rs_cache_view(
+     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+     ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+ 
+-    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, inp->s_copy_extra);
++    ggml_tensor * states_extra = ggml_get_rows(ctx0, states, base_rows ? inp->s_copy_base_extra : inp->s_copy_extra);
+     ggml_build_forward_expand(gf,
+         ggml_cpy(ctx0,
+             states_extra,
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index de4674b70..c24d82f73 100644
+index de4674b70..bba96b0c9 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -322,6 +322,11 @@ public:
+@@ -322,6 +322,19 @@ public:
      ggml_tensor * s_write_rows = nullptr;
      int64_t       s_write_K    = 0;
  
@@ -3688,10 +4658,18 @@ index de4674b70..c24d82f73 100644
 +    std::vector<int32_t> snapshot_indices;
 +    bool custom_snapshots = false;
 +
++    // rollback journal (see llama_memory_recurrent::journal)
++    ggml_tensor * s_copy_base       = nullptr; // I32 [n_rs], S source rows (no rollback plane)
++    ggml_tensor * s_copy_base_main  = nullptr; // I32 [n_seqs]
++    ggml_tensor * s_copy_base_extra = nullptr; // I32 [n_rs - n_seqs]
++    ggml_tensor * s_journal_plan    = nullptr; // I32 [2*n_rs], (row, count) applied before S is read
++    // this ubatch carries an in-pass snapshot request (its snapshots go to checkpoint buffers)
++    bool snapshot_request = false;
++
      const llama_memory_recurrent_context * mctx;
  
      // used in view offsets, need to match for valid graph reuse
-@@ -916,7 +921,8 @@ struct llm_graph_params {
+@@ -916,7 +929,8 @@ struct llm_graph_params {
          }
  
          // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
@@ -3701,28 +4679,181 @@ index de4674b70..c24d82f73 100644
              return false;
          }
  
+@@ -1375,12 +1389,14 @@ struct llm_graph_context {
+ 
+     llm_graph_input_rs * build_rs_inp() const;
+ 
++    // base_rows: read S base rows (rollback journal) instead of rollback planes
+     ggml_tensor * build_rs(
+             llm_graph_input_rs * inp,
+             ggml_tensor * s,
+                 int32_t   state_size,
+                 int32_t   n_seqs,
+-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
++            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
++                   bool   base_rows = false) const;
+ 
+     // like build_rs, but WITHOUT the main per-seq state gather: performs the
+     // rs_zero clear and the extra-states relocation, then returns the 2D
+@@ -1391,7 +1407,8 @@ struct llm_graph_context {
+             llm_graph_input_rs * inp,
+             ggml_tensor * s,
+                 int32_t   state_size,
+-                int32_t   n_seqs) const;
++                int32_t   n_seqs,
++                   bool   base_rows = false) const;
+ 
+     // I64 cache-row indices for the rows-mode snapshot scatter: row of
+     // (slot s, seq i) = s*mem_size + head + i, matching the strided-cpy
+diff --git a/src/llama-io.h b/src/llama-io.h
+index f276af4fb..82240c27b 100644
+--- a/src/llama-io.h
++++ b/src/llama-io.h
+@@ -17,6 +17,14 @@ public:
+     // bytes written so far
+     virtual size_t n_bytes() = 0;
+ 
++    // false: write_tensor() only counts the bytes (size queries)
++    virtual bool stores_tensor_data() const { return true; }
++
++    // false: the io keeps tensor references (device copies, in-pass records) and
++    // its caller completes the recurrent S rows; true: the bytes go to the
++    // record, even if write_tensor() reads them at the io's destruction
++    virtual bool tensor_writes_immediate() const { return true; }
++
+     void write_string(const std::string & str);
+ };
+ 
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index e2990972e..3de596f22 100644
+index e2990972e..2586e0831 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -34,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+@@ -5,6 +5,7 @@
+ #include "llama-io.h"
+ #include "llama-batch.h"
+ #include "llama-model.h"
++#include "llama-arch.h"
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -34,6 +35,37 @@ llama_memory_recurrent::llama_memory_recurrent(
  
      this->n_rs_seq = n_rs_seq;
      rs_idx.assign(n_seq_max, 0);
 +    rs_invalid_from.assign(n_seq_max, n_rs_seq + 1);
++
++    // Rollback journal: the delta-net graph of these architectures builds the
++    // journal ops, which only the CUDA backend implements, so every recurrent
++    // layer must live on a CUDA device.
++    if (n_rs_seq > 0 && offload && model.arch == LLM_ARCH_QWEN35 &&
++            hparams.ssm_n_group > 0 && hparams.ssm_dt_rank > 0 &&
++            hparams.ssm_dt_rank % hparams.ssm_n_group == 0 &&
++            (int64_t) hparams.ssm_d_inner == (int64_t) hparams.ssm_d_state * hparams.ssm_dt_rank &&
++            (int64_t) hparams.n_embd_s() == (int64_t) hparams.ssm_d_state * hparams.ssm_d_state * hparams.ssm_dt_rank) {
++        journal = true;
++        for (int i = 0; i < n_layer; i++) {
++            if (filter && !filter(i)) {
++                continue;
++            }
++            ggml_backend_dev_t dev = model.dev_layer(i);
++            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++            if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
++                journal = false;
++                break;
++            }
++        }
++    }
++    if (journal) {
++        n_journal   = n_rs_seq;
++        journal_s_v = hparams.ssm_d_state;
++        journal_h_k = hparams.ssm_n_group;
++        journal_h_v = hparams.ssm_dt_rank;
++        journal_count.assign(mem_size, 0);
++        state_undefined.assign(n_seq_max, false);
++    }
  
      cells.clear();
      cells.resize(mem_size);
-@@ -145,6 +146,7 @@ void llama_memory_recurrent::clear(bool data) {
+@@ -51,7 +83,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+         auto it = ctx_map.find(buft);
+         if (it == ctx_map.end()) {
+             ggml_init_params params = {
+-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
++                /*.mem_size   =*/ size_t(3u*n_layer*ggml_tensor_overhead()),
+                 /*.mem_buffer =*/ NULL,
+                 /*.no_alloc   =*/ true,
+             };
+@@ -71,6 +103,7 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+     r_l.resize(n_layer);
+     s_l.resize(n_layer);
++    j_l.resize(n_layer);
+ 
+     for (int i = 0; i < n_layer; i++) {
+         if (filter && !filter(i)) {
+@@ -98,11 +131,19 @@ llama_memory_recurrent::llama_memory_recurrent(
+ 
+         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
++        // journal: one base row per cell, the rollback states live in the journal
++        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), journal ? mem_size : n_rows);
+         ggml_format_name(r, "cache_r_l%d", i);
+         ggml_format_name(s, "cache_s_l%d", i);
+         r_l[i] = r;
+         s_l[i] = s;
++        if (journal) {
++            GGML_ASSERT(type_s == GGML_TYPE_F32);
++            const int64_t n_embd_j = (int64_t) n_journal * ggml_gated_delta_net_journal_entry_size(journal_s_v, journal_h_k, journal_h_v);
++            ggml_tensor * j = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_j, mem_size);
++            ggml_format_name(j, "cache_j_l%d", i);
++            j_l[i] = j;
++        }
+     }
+ 
+     // allocate tensors and initialize the buffers to avoid NaNs in the padding
+@@ -116,6 +157,17 @@ llama_memory_recurrent::llama_memory_recurrent(
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+     }
+ 
++    if (journal) {
++        size_t memory_size_j = 0;
++        for (const auto & j : j_l) {
++            if (j != nullptr) {
++                memory_size_j += ggml_nbytes(j);
++            }
++        }
++        LLAMA_LOG_INFO("%s: rollback journal: %u tokens, S keeps 1 base row per cell, J (f32): %7.2f MiB\n", __func__,
++                n_journal, (float) memory_size_j / (1024.0f * 1024.0f));
++    }
++
+     {
+         const size_t memory_size_r = size_r_bytes();
+         const size_t memory_size_s = size_s_bytes();
+@@ -145,6 +197,12 @@ void llama_memory_recurrent::clear(bool data) {
      }
  
      std::fill(rs_idx.begin(), rs_idx.end(), 0);
 +    erase_state_snapshot_records(-1);
++
++    if (journal) {
++        std::fill(journal_count.begin(), journal_count.end(), 0);
++        std::fill(state_undefined.begin(), state_undefined.end(), false);
++    }
  }
  
  bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-@@ -168,6 +170,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -166,8 +224,17 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+     if (rm_all) {
          set_rs_idx(seq_id, 0);
++        if (journal) {
++            if (seq_id < 0) {
++                std::fill(state_undefined.begin(), state_undefined.end(), false);
++            } else {
++                state_undefined[seq_id] = false;
++            }
++        }
      }
  
 +    erase_state_snapshot_records(seq_id);
@@ -3730,7 +4861,7 @@ index e2990972e..3de596f22 100644
      // models like Mamba or RWKV can't have a state partially erased at the end
      // of the sequence because their state isn't preserved for previous tokens
      if (seq_id >= (int64_t) size) {
-@@ -184,7 +188,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -184,7 +251,21 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                  const llama_pos rollback = cell.pos - (p0 - 1);
                  // pending rollback is single-use
                  const bool pending = rs_idx[seq_id] != 0;
@@ -3738,10 +4869,32 @@ index e2990972e..3de596f22 100644
 +                // planes last written as in-pass snapshots are not rollback states
 +                const bool plane_valid = rollback < (llama_pos) rs_invalid_from[seq_id];
 +                if (!pending && rollback >= 1 && rollback <= (llama_pos) n_rs_seq && plane_valid) {
++                    // Journal: same decision as the rollback planes. The base and the
++                    // first (count - rollback) entries are the state rollback tokens back.
++                    if (journal && !state_undefined[seq_id]) {
++                        const uint32_t row = cell.src >= 0 ? (uint32_t) cell.src : (uint32_t) tail_id;
++                        if ((uint32_t) rollback > journal_count[row]) {
++                            // the states before the journaled tokens are gone; the caller must re-evaluate
++                            LLAMA_LOG_ERROR("%s: rollback of %d tokens for seq %d, but its recurrent state journals only %u\n",
++                                    __func__, (int) rollback, seq_id, journal_count[row]);
++                            return false;
++                        }
++                        journal_count[row] -= (uint32_t) rollback;
++                    }
                      set_rs_idx(seq_id, (uint32_t) rollback);
                      cell.pos = p0 - 1;
                      return true;
-@@ -249,6 +255,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+@@ -220,6 +301,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+                 }
+                 cells[i].pos = -1;
+                 cells[i].src = -1;
++                if (journal) {
++                    journal_count[i] = 0;
++                }
+                 if (new_head == size) {
+                     new_head = i;
+                 }
+@@ -249,6 +333,15 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
      }
  
      if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
@@ -3749,12 +4902,15 @@ index e2990972e..3de596f22 100644
 +        erase_state_snapshot_records(seq_id_dst);
 +        if ((uint32_t) seq_id_dst < n_seq_max && (uint32_t) seq_id_src < n_seq_max) {
 +            rs_invalid_from[seq_id_dst] = rs_invalid_from[seq_id_src];
++            if (journal) {
++                state_undefined[seq_id_dst] = state_undefined[seq_id_src];
++            }
 +        }
 +
          auto & tail_src = cells[seq_id_src];
          auto & tail_dst = cells[seq_id_dst];
          if (tail_dst.tail >= 0) {
-@@ -275,6 +287,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+@@ -275,6 +368,18 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
  void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
      uint32_t new_head = size;
  
@@ -3762,10 +4918,28 @@ index e2990972e..3de596f22 100644
 +        it = it->first == seq_id ? std::next(it) : state_snapshot_records.erase(it);
 +    }
 +
++    if (journal) {
++        for (uint32_t s = 0; s < n_seq_max; ++s) {
++            if ((llama_seq_id) s != seq_id) {
++                state_undefined[s] = false;
++            }
++        }
++    }
++
      for (uint32_t i = 0; i < size; ++i) {
          if ((llama_seq_id) i != seq_id) {
              cells[i].tail = -1;
-@@ -309,6 +325,9 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
+@@ -288,6 +393,9 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+             cells[i].pos = -1;
+             cells[i].src = -1;
+             cells[i].seq_id.clear();
++            if (journal) {
++                journal_count[i] = 0;
++            }
+ 
+             if (new_head == size){
+                 new_head = i;
+@@ -309,6 +417,9 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
          return;
      }
  
@@ -3775,7 +4949,7 @@ index e2990972e..3de596f22 100644
      if (p0 < 0) {
          p0 = 0;
      }
-@@ -339,6 +358,9 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
+@@ -339,6 +450,9 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
          return;
      }
  
@@ -3785,7 +4959,7 @@ index e2990972e..3de596f22 100644
      if (p0 < 0) {
          p0 = 0;
      }
-@@ -406,6 +428,190 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+@@ -406,6 +520,204 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
      rs_idx[seq_id] = idx;
  }
  
@@ -3959,6 +5133,16 @@ index e2990972e..3de596f22 100644
 +        return false;
 +    }
 +
++    // journal: the snapshot was written to request slot idx-1's dst, not to a plane
++    if (journal) {
++        const auto it_dst = snapshot_dsts.find(seq_id);
++        if (it_dst == snapshot_dsts.end() || idx - 1 >= it_dst->second.size() || it_dst->second[idx - 1].s.empty()) {
++            return false;
++        }
++        selected_dst_seq  = seq_id;
++        selected_dst_slot = (int32_t) idx - 1;
++    }
++
 +    old_pos = cells[tail].pos;
 +    set_rs_idx(seq_id, idx);
 +    cells[tail].pos = pos;
@@ -3971,12 +5155,51 @@ index e2990972e..3de596f22 100644
 +    GGML_ASSERT(tail >= 0);
 +    cells[tail].pos = pos;
 +    set_rs_idx(seq_id, 0);
++    if (selected_dst_seq == seq_id) {
++        selected_dst_seq  = -1;
++        selected_dst_slot = -1;
++    }
 +}
 +
  std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
      std::map<ggml_backend_buffer_type_t, size_t> ret;
      for (const auto & [_, buf] : ctxs_bufs) {
-@@ -850,6 +1056,15 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
+@@ -818,7 +1130,33 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
+     io.write(&cell_count, sizeof(cell_count));
+ 
+     state_write_meta(io, cell_ranges, seq_id);
+-    state_write_data(io, cell_ranges_data);
++
++    if (!journal) {
++        state_write_data(io, cell_ranges_data);
++        return;
++    }
++
++    // Journal: S rows are written as logical states (base + pending entries);
++    // R rows come from the rollback planes.
++    std::vector<std::pair<uint32_t, uint32_t>> s_rows; // (base row, pending entries) per cell
++    for (uint32_t i = 0; i < size; ++i) {
++        const auto & cell = cells[i];
++        if ((seq_id == -1 && !cell.is_empty()) || cell.has_seq_id(seq_id)) {
++            for (const llama_seq_id cell_seq_id : cell.seq_id) {
++                journal_check_defined(cell_seq_id);
++            }
++            const uint32_t row = cell.src >= 0 ? (uint32_t) cell.src : i;
++            s_rows.emplace_back(row, journal_count[row]);
++        }
++    }
++
++    const state_snapshot_dst * staged = nullptr;
++    if (seq_id >= 0 && seq_id == selected_dst_seq) {
++        staged = &snapshot_dsts.at(seq_id).at(selected_dst_slot);
++        GGML_ASSERT(s_rows.size() == 1);
++    }
++
++    state_write_data_journal(io, cell_ranges_data, s_rows, staged);
+ }
+ 
+ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+@@ -850,6 +1188,27 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
      if (n_rs_seq != 0) {
          set_rs_idx(seq_id, 0);
      }
@@ -3984,6 +5207,18 @@ index e2990972e..3de596f22 100644
 +    // Only the live state was restored; the rollback planes still belong to
 +    // the previous contents and are not trailing states of the restored one.
 +    erase_state_snapshot_records(seq_id);
++
++    // journal: the restored rows are plain base states
++    if (journal) {
++        for (uint32_t i = 0; i < cell_count; ++i) {
++            journal_count[head + i] = 0;
++        }
++        if (seq_id < 0) {
++            std::fill(state_undefined.begin(), state_undefined.end(), false);
++        } else if ((uint32_t) seq_id < n_seq_max) {
++            state_undefined[seq_id] = false;
++        }
++    }
 +    if (seq_id < 0) {
 +        std::fill(rs_invalid_from.begin(), rs_invalid_from.end(), 1);
 +    } else if ((uint32_t) seq_id < n_seq_max) {
@@ -3992,17 +5227,405 @@ index e2990972e..3de596f22 100644
  }
  
  void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id) const {
-@@ -1214,6 +1429,9 @@ bool llama_memory_recurrent_context::apply() {
+@@ -1175,6 +1534,386 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+     return true;
+ }
+ 
++//
++// rollback journal
++//
++
++void llama_memory_recurrent::set_state_snapshot_dsts(llama_seq_id seq_id, std::vector<state_snapshot_dst> dsts) {
++    GGML_ASSERT(journal);
++    if (selected_dst_seq == seq_id) {
++        selected_dst_seq  = -1;
++        selected_dst_slot = -1;
++    }
++    if (dsts.empty()) {
++        snapshot_dsts.erase(seq_id);
++    } else {
++        snapshot_dsts[seq_id] = std::move(dsts);
++    }
++}
++
++void llama_memory_recurrent::clear_state_snapshot_dsts(llama_seq_id seq_id) {
++    if (seq_id < 0) {
++        snapshot_dsts.clear();
++    } else {
++        snapshot_dsts.erase(seq_id);
++    }
++    if (seq_id < 0 || selected_dst_seq == seq_id) {
++        selected_dst_seq  = -1;
++        selected_dst_slot = -1;
++    }
++}
++
++void llama_memory_recurrent::clear_state_snapshot_dst(llama_seq_id seq_id, uint32_t slot) {
++    const auto it = snapshot_dsts.find(seq_id);
++    if (it != snapshot_dsts.end() && slot < it->second.size()) {
++        it->second[slot].r.clear();
++        it->second[slot].s.clear();
++    }
++}
++
++const llama_memory_recurrent::state_snapshot_dst * llama_memory_recurrent::state_snapshot_dst_for(
++        const llama_ubatch & ubatch, uint32_t slot) const {
++    if (!journal || state_snapshot_request(ubatch) == nullptr) {
++        return nullptr;
++    }
++    const auto it = snapshot_dsts.find(ubatch.seq_id[0][0]);
++    if (it == snapshot_dsts.end() || slot >= it->second.size() || it->second[slot].s.empty()) {
++        return nullptr;
++    }
++    return &it->second[slot];
++}
++
++bool llama_memory_recurrent::has_state_snapshot_request(const llama_ubatch & ubatch) const {
++    return state_snapshot_request(ubatch) != nullptr;
++}
++
++int32_t llama_memory_recurrent::selected_snapshot_dst(llama_seq_id seq_id) const {
++    return seq_id == selected_dst_seq ? selected_dst_slot : -1;
++}
++
++void llama_memory_recurrent::journal_check_defined(llama_seq_id seq_id) const {
++    if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max && state_undefined[seq_id]) {
++        GGML_ABORT("%s: the recurrent state of seq %d is undefined after a failed ubatch; "
++                "remove or restore the sequence before using it", __func__, seq_id);
++    }
++}
++
++void llama_memory_recurrent::journal_apply(const llama_ubatch & ubatch) {
++    if (!journal) {
++        return;
++    }
++
++    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++        const uint32_t i = s*ubatch.n_seq_tokens;
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            journal_check_defined(ubatch.seq_id[i][j]);
++        }
++    }
++
++    // The graph applies the pending entries of every source row before it reads
++    // S, once per row: cells copied from one shared cell name the same row, and
++    // the commit is in place. rs_z is cleared instead (its cells start from a
++    // zero state). An idle cell of the range that only copies onto itself keeps
++    // its pending entries.
++    journal_plan.assign(2*n, 0);
++    journal_kept.assign(n, false);
++    for (uint32_t i = 0; i < n; ++i) {
++        const int32_t row = cells[head + i].src0;
++        GGML_ASSERT(row >= 0 && (uint32_t) row < size);
++        journal_plan[2*i + 0] = row;
++    }
++    for (uint32_t i = ubatch.n_seqs; i < n; ++i) {
++        const int32_t row = journal_plan[2*i];
++        bool kept = row == (int32_t) (head + i) && row != rs_z;
++        for (uint32_t k = 0; kept && k < n; ++k) {
++            kept = k == i || journal_plan[2*k] != row;
++        }
++        journal_kept[i] = kept;
++    }
++    std::vector<bool> committed(size, false);
++    for (uint32_t i = 0; i < n; ++i) {
++        const int32_t row = journal_plan[2*i];
++        if (journal_kept[i] || row == rs_z || committed[row]) {
++            continue;
++        }
++        journal_plan[2*i + 1] = (int32_t) journal_count[row];
++        committed[row] = true;
++        journal_count[row] = 0;
++    }
++
++    // Rows written by this ubatch: the extra rows receive committed copies;
++    // each sequence's row receives its base and the journal of its last tokens.
++    // An in-pass snapshot ubatch stores its final state as the base (no rollback
++    // is allowed after it, as rs_invalid_from records).
++    for (uint32_t i = 0; i < n; ++i) {
++        if (!journal_kept[i]) {
++            journal_count[head + i] = 0;
++        }
++    }
++    if (state_snapshot_request(ubatch) == nullptr) {
++        const uint32_t count = std::min<uint32_t>(ubatch.n_seq_tokens, n_journal);
++        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
++            journal_count[head + s] = count;
++        }
++    }
++}
++
++void llama_memory_recurrent::journal_ubatch_failed(const llama_ubatch & ubatch) {
++    if (!journal) {
++        return;
++    }
++    // The graph may have committed entries, partly or fully, and may have written some
++    // bases: nothing about these rows is known any more. A source row whose
++    // entries were taken over by the plan may belong to another sequence too.
++    auto mark_undefined = [&](const mem_cell & cell) {
++        for (const llama_seq_id seq_id : cell.seq_id) {
++            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
++                state_undefined[seq_id] = true;
++            }
++        }
++    };
++    for (size_t i = 0; i < journal_plan.size()/2; ++i) {
++        if (journal_plan[2*i + 1] > 0) {
++            mark_undefined(cells[journal_plan[2*i + 0]]);
++        }
++    }
++    // a kept cell is only copied onto itself, which leaves its base as it was
++    for (uint32_t i = 0; i < n; ++i) {
++        if (i >= journal_kept.size() || !journal_kept[i]) {
++            journal_count[head + i] = 0;
++        }
++    }
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            const llama_seq_id seq_id = ubatch.seq_id[i][j];
++            if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
++                state_undefined[seq_id] = true;
++            }
++        }
++    }
++}
++
++void llama_memory_recurrent::journal_set_backends(const std::vector<ggml_backend_t> & backends) {
++    journal_backends = backends;
++}
++
++ggml_backend_t llama_memory_recurrent::journal_backend_for(const ggml_tensor * t) const {
++    const ggml_tensor * base = t->view_src != nullptr ? t->view_src : t;
++    GGML_ASSERT(base->buffer != nullptr);
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(base->buffer);
++    for (ggml_backend_t backend : journal_backends) {
++        if (ggml_backend_supports_buft(backend, buft) && !ggml_backend_buffer_is_host(base->buffer)) {
++            return backend;
++        }
++    }
++    GGML_ABORT("%s: no backend to commit the recurrent journal on buffer type %s", __func__, ggml_backend_buft_name(buft));
++}
++
++void llama_memory_recurrent::journal_commit_row(int32_t il, uint32_t row, uint32_t count, ggml_tensor * dst) const {
++    // dst: one contiguous S row (n_embd_s floats) on a device; it runs between decodes.
++    // One persistent graph with one commit node: its tensors are re-pointed at
++    // every commit, so a backend's graph cache, keyed by the first node, holds
++    // a single entry for it whatever the number of commits.
++    GGML_ASSERT(count > 0 && count <= n_journal);
++    GGML_ASSERT(ggml_nelements(dst) == (int64_t) hparams.n_embd_s() && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(dst) && dst->buffer != nullptr && dst->data != nullptr);
++
++    ggml_tensor * j = j_l[il];
++
++    if (journal_commit_gf == nullptr) {
++        ggml_init_params params = {
++            /*.mem_size   =*/ 3*ggml_tensor_overhead(), // st, jr, c
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        journal_commit_ctx.reset(ggml_init(params));
++        GGML_ASSERT(journal_commit_ctx);
++        ggml_context * ctx = journal_commit_ctx.get();
++
++        journal_commit_st = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_s(), 1);
++        journal_commit_jr = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, j->ne[0], 1);
++        journal_commit_c  = ggml_gated_delta_net_commit(ctx, journal_commit_st, journal_commit_jr, nullptr,
++                journal_s_v, journal_h_k, journal_h_v, (int) n_journal, (int) count);
++
++        // the graph holds every tensor of its context
++        size_t n_tensors = 0;
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            ++n_tensors;
++        }
++        ggml_init_params gparams = {
++            /*.mem_size   =*/ ggml_graph_overhead_custom(n_tensors, false),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        journal_commit_gctx.reset(ggml_init(gparams));
++        GGML_ASSERT(journal_commit_gctx);
++        journal_commit_gf = ggml_new_graph_custom(journal_commit_gctx.get(), n_tensors, false);
++        ggml_build_forward_expand(journal_commit_gf, journal_commit_c);
++    }
++
++    GGML_ASSERT(ggml_nbytes(journal_commit_jr) == (size_t) j->nb[1]);
++
++    journal_commit_st->buffer = dst->buffer;
++    journal_commit_st->data   = dst->data;
++    journal_commit_jr->buffer = j->buffer;
++    journal_commit_jr->data   = (char *) j->data + (size_t) row*j->nb[1];
++    journal_commit_c->buffer  = journal_commit_st->buffer;
++    journal_commit_c->data    = journal_commit_st->data;
++    ggml_gated_delta_net_commit_set_count(journal_commit_c, (int) count);
++
++    ggml_backend_t backend = journal_backend_for(dst);
++    if (ggml_backend_graph_compute(backend, journal_commit_gf) != GGML_STATUS_SUCCESS) {
++        GGML_ABORT("%s: failed to commit the recurrent journal", __func__);
++    }
++    ggml_backend_synchronize(backend);
++}
++
++ggml_tensor * llama_memory_recurrent::journal_scratch_row(int32_t il, uint32_t row) const {
++    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_l[il]->buffer);
++    if (journal_scratch == nullptr || ggml_backend_buffer_get_type(journal_scratch_buf.get()) != buft) {
++        ggml_init_params params = {
++            /*.mem_size   =*/ ggml_tensor_overhead(),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        journal_scratch_buf.reset();
++        journal_scratch_ctx.reset(ggml_init(params));
++        journal_scratch = ggml_new_tensor_1d(journal_scratch_ctx.get(), GGML_TYPE_F32, hparams.n_embd_s());
++        journal_scratch_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(journal_scratch_ctx.get(), buft));
++        if (!journal_scratch_buf) {
++            throw std::runtime_error("failed to allocate the recurrent journal scratch row");
++        }
++    }
++
++    // copy the base row
++    ggml_init_params params = {
++        /*.mem_size   =*/ ggml_tensor_overhead(),
++        /*.mem_buffer =*/ NULL,
++        /*.no_alloc   =*/ true,
++    };
++    ggml_context_ptr ctx { ggml_init(params) };
++    ggml_tensor * src = ggml_view_1d(ctx.get(), s_l[il], hparams.n_embd_s(), (size_t) row*s_l[il]->nb[1]);
++    ggml_backend_view_init(src);
++    ggml_backend_tensor_copy(src, journal_scratch);
++
++    return journal_scratch;
++}
++
++void llama_memory_recurrent::journal_commit_copies(llama_seq_id seq_id,
++        const std::vector<ggml_tensor *> & org, const std::vector<ggml_tensor *> & cpy) const {
++    if (!journal) {
++        return;
++    }
++    GGML_UNUSED(seq_id);
++    GGML_ASSERT(org.size() == cpy.size());
++
++    const uint32_t n_layer = hparams.n_layer();
++    for (size_t k = 0; k < org.size(); ++k) {
++        for (uint32_t il = 0; il < n_layer; ++il) {
++            if (s_l[il] == nullptr || org[k]->view_src != s_l[il]) {
++                continue;
++            }
++            // the copy holds whole base rows starting at this row
++            const size_t row_size = s_l[il]->nb[1];
++            GGML_ASSERT(org[k]->view_offs % row_size == 0 && ggml_nbytes(cpy[k]) % row_size == 0);
++            const uint32_t row0   = (uint32_t) (org[k]->view_offs / row_size);
++            const uint32_t n_rows = (uint32_t) (ggml_nbytes(cpy[k]) / row_size);
++            for (uint32_t r = 0; r < n_rows; ++r) {
++                const uint32_t count = journal_count[row0 + r];
++                if (count == 0) {
++                    continue;
++                }
++                ggml_init_params params = {
++                    /*.mem_size   =*/ ggml_tensor_overhead(),
++                    /*.mem_buffer =*/ NULL,
++                    /*.no_alloc   =*/ true,
++                };
++                ggml_context_ptr ctx { ggml_init(params) };
++                ggml_tensor * dst = ggml_view_1d(ctx.get(), cpy[k], hparams.n_embd_s(), (size_t) r*row_size);
++                ggml_backend_view_init(dst);
++                journal_commit_row((int32_t) il, row0 + r, count, dst);
++            }
++        }
++    }
++}
++
++void llama_memory_recurrent::state_write_data_journal(llama_io_write_i & io,
++        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
++        const std::vector<std::pair<uint32_t, uint32_t>> & s_rows,
++        const state_snapshot_dst * staged) const {
++    const uint32_t s_trans = 0;
++    const uint32_t n_layer = hparams.n_layer();
++
++    io.write(&s_trans, sizeof(s_trans));
++    io.write(&n_layer, sizeof(n_layer));
++
++    // R: same records as state_write_data
++    for (uint32_t il = 0; il < n_layer; ++il) {
++        if (r_l[il] == nullptr) continue;
++
++        const int32_t r_type_i = (int32_t)r_l[il]->type;
++        io.write(&r_type_i, sizeof(r_type_i));
++
++        const uint64_t r_size_row = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
++        io.write(&r_size_row, sizeof(r_size_row));
++
++        if (staged != nullptr) {
++            io.write_tensor(staged->r[il], 0, r_size_row);
++            continue;
++        }
++        for (const auto & range : cell_ranges) {
++            const size_t range_size = range.second - range.first;
++            io.write_tensor(r_l[il], range.first * r_size_row, range_size * r_size_row);
++        }
++    }
++
++    // S: the logical state of each cell. Copies made after the io (device) and
++    // size queries take the base rows; the device caller applies the pending
++    // entries onto its copies (journal_commit_copies). Immediate writes
++    // are committed into a device scratch row first.
++    const bool commit_now = io.stores_tensor_data() && io.tensor_writes_immediate();
++    std::vector<uint8_t> scratch_data;
++
++    for (uint32_t il = 0; il < n_layer; ++il) {
++        if (s_l[il] == nullptr) continue;
++
++        const int32_t s_type_i = (int32_t)s_l[il]->type;
++        io.write(&s_type_i, sizeof(s_type_i));
++
++        const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
++        io.write(&s_size_row, sizeof(s_size_row));
++
++        if (staged != nullptr) {
++            io.write_tensor(staged->s[il], 0, s_size_row);
++            continue;
++        }
++
++        // consecutive rows are written as one range, as state_write_data does
++        size_t k = 0;
++        while (k < s_rows.size()) {
++            const uint32_t row = s_rows[k].first;
++            if (commit_now && s_rows[k].second > 0) {
++                ggml_tensor * scratch = journal_scratch_row(il, row);
++                journal_commit_row((int32_t) il, row, s_rows[k].second, scratch);
++                // read the shared scratch row now: a host io defers write_tensor
++                // reads to its destruction, when the row holds a later commit
++                scratch_data.resize(s_size_row);
++                ggml_backend_tensor_get(scratch, scratch_data.data(), 0, s_size_row);
++                io.write(scratch_data.data(), s_size_row);
++                ++k;
++                continue;
++            }
++            size_t n_rows = 1;
++            while (k + n_rows < s_rows.size() && s_rows[k + n_rows].first == row + n_rows &&
++                    !(commit_now && s_rows[k + n_rows].second > 0)) {
++                ++n_rows;
++            }
++            io.write_tensor(s_l[il], row * s_size_row, n_rows * s_size_row);
++            k += n_rows;
++        }
++    }
++}
++
+ //
+ // llama_memory_recurrent_context
+ //
+@@ -1214,6 +1953,10 @@ bool llama_memory_recurrent_context::apply() {
  
      mem->find_slot(ubatches[i_next]);
  
 +    // Every computed ubatch passes here, whether its graph is rebuilt or reused.
++    mem->journal_apply(ubatches[i_next]);
 +    mem->record_state_snapshots(ubatches[i_next]);
 +
      return true;
  }
  
-@@ -1251,6 +1469,18 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+@@ -1251,6 +1994,18 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
      return mem->s_l[il];
  }
  
@@ -4021,11 +5644,64 @@ index e2990972e..3de596f22 100644
  int32_t llama_memory_recurrent_context::s_copy(int i) const {
      const uint32_t cell_idx = i + mem->head;
      const int32_t  src0     = mem->cells[cell_idx].src0;
+@@ -1270,3 +2025,43 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     }
+     return (int32_t)(idx * mem->size) + src0;
+ }
++
++bool llama_memory_recurrent_context::journal_enabled() const {
++    return mem->journal;
++}
++
++uint32_t llama_memory_recurrent_context::get_n_journal() const {
++    return mem->n_journal;
++}
++
++ggml_tensor * llama_memory_recurrent_context::get_j_l(int32_t il) const {
++    return mem->j_l[il];
++}
++
++int64_t llama_memory_recurrent_context::get_journal_h_k() const {
++    return mem->journal_h_k;
++}
++
++int32_t llama_memory_recurrent_context::s_copy_base(int i) const {
++    return mem->cells[i + mem->head].src0;
++}
++
++int32_t llama_memory_recurrent_context::journal_plan_row(int i) const {
++    return mem->journal_plan[2*i + 0];
++}
++
++int32_t llama_memory_recurrent_context::journal_plan_count(int i) const {
++    return mem->journal_plan[2*i + 1];
++}
++
++bool llama_memory_recurrent_context::has_state_snapshot_request(const llama_ubatch & ubatch) const {
++    if (is_full) {
++        return mem->journal && mem->journal_reserve_snapshot && ubatch.n_seqs == 1;
++    }
++    return mem->has_state_snapshot_request(ubatch);
++}
++
++const llama_memory_recurrent::state_snapshot_dst * llama_memory_recurrent_context::get_state_snapshot_dst(
++        const llama_ubatch & ubatch, uint32_t slot) const {
++    return is_full ? nullptr : mem->state_snapshot_dst_for(ubatch, slot);
++}
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index b13b7b748..33e3e6412 100644
+index b13b7b748..dce401713 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
-@@ -78,6 +78,35 @@ public:
+@@ -4,6 +4,8 @@
+ #include "llama-graph.h"
+ #include "llama-memory.h"
+ 
++#include "ggml-backend.h"
++
+ #include <map>
+ #include <set>
+ #include <vector>
+@@ -78,6 +80,98 @@ public:
  
      void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
  
@@ -4058,14 +5734,114 @@ index b13b7b748..33e3e6412 100644
 +    bool select_state_snapshot(llama_seq_id seq_id, uint32_t idx, llama_pos pos, llama_pos & old_pos);
 +    void restore_state_snapshot(llama_seq_id seq_id, llama_pos pos);
 +
++    // Rollback journal: on CUDA, the S state
++    // keeps one base row per cell and a journal of the operands of the last
++    // n_rs_seq tokens; the logical state is the base with the first
++    // journal_count[row] entries applied. R keeps its 1 + n_rs_seq planes.
++    // Chosen once at construction; otherwise S has 1 + n_rs_seq planes.
++    bool journal = false;
++    uint32_t n_journal = 0;      // journal capacity, n_rs_seq
++    int64_t journal_s_v = 0;     // state head size
++    int64_t journal_h_k = 0;     // k heads
++    int64_t journal_h_v = 0;     // v heads
++
++    // per layer: F32 [n_journal * entry, mem_size]; row r is the journal of S row r
++    std::vector<ggml_tensor *> j_l;
++
++    // Destinations of the in-pass snapshots of one request slot, per layer
++    // (nullptr for layers without recurrent state). They are tensors of a
++    // device checkpoint buffer owned by llama_context.
++    struct state_snapshot_dst {
++        std::vector<ggml_tensor *> r;
++        std::vector<ggml_tensor *> s;
++    };
++
++    // Journal mode: the next decode writes the snapshots of request slot i of
++    // seq_id into dsts[i] instead of rollback planes. Kept until cleared, so a
++    // snapshot can be serialized after the decode.
++    void set_state_snapshot_dsts(llama_seq_id seq_id, std::vector<state_snapshot_dst> dsts);
++    void clear_state_snapshot_dsts(llama_seq_id seq_id);
++    // a dst whose buffer became a checkpoint is no longer selectable
++    void clear_state_snapshot_dst(llama_seq_id seq_id, uint32_t slot);
++    const state_snapshot_dst * state_snapshot_dst_for(const llama_ubatch & ubatch, uint32_t slot) const;
++
++    // the request slot selected by select_state_snapshot() if it lives in a dst, else -1
++    int32_t selected_snapshot_dst(llama_seq_id seq_id) const;
++
++    // the ubatch carries an in-pass snapshot request
++    bool has_state_snapshot_request(const llama_ubatch & ubatch) const;
++
++    // Called from apply() after find_slot(): the (row, count) pairs the next
++    // graph applies before reading S, and the journal counts after the ubatch.
++    void journal_apply(const llama_ubatch & ubatch);
++
++    // Called when the graph of an applied ubatch failed: its sequences have an
++    // undefined state until they are cleared or restored.
++    void journal_ubatch_failed(const llama_ubatch & ubatch);
++
++    // Backends used to commit journals outside a decode graph (state saves).
++    void journal_set_backends(const std::vector<ggml_backend_t> & backends);
++
++    // After a device save of seq_id copied the base rows (org views of s_l)
++    // into cpy, apply the pending journal entries to those copies.
++    void journal_commit_copies(llama_seq_id seq_id,
++            const std::vector<ggml_tensor *> & org, const std::vector<ggml_tensor *> & cpy) const;
++
++    // Set by llama_context while it reserves the graph of an in-pass snapshot
++    // ubatch (one sequence, K-slot GDN output), so that graph's compute buffer
++    // is allocated at init and never grows at run time.
++    bool journal_reserve_snapshot = false;
++
++    // per cell of the current ubatch range: row and count to commit (journal_apply)
++    std::vector<int32_t> journal_plan;
++    // per cell of the current ubatch range: an idle cell that keeps its pending entries
++    std::vector<bool> journal_kept;
++
      // computed before each graph build
      uint32_t n = 0;
  
-@@ -121,6 +150,24 @@ private:
+@@ -121,6 +215,61 @@ private:
      // ggml contexts for the KV cache along with the allocated backend buffers:
      std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
  
 +    std::map<llama_seq_id, std::vector<llama_pos>> state_snapshots;
++
++    // journal mode: per S row, entries pending on the base state
++    std::vector<uint32_t> journal_count;
++
++    // journal mode: per seq, set after a failed ubatch (journal_ubatch_failed)
++    std::vector<bool> state_undefined;
++
++    std::map<llama_seq_id, std::vector<state_snapshot_dst>> snapshot_dsts;
++
++    // journal mode: seq and request slot of the snapshot selected for serialization
++    llama_seq_id selected_dst_seq  = -1;
++    int32_t      selected_dst_slot = -1;
++
++    std::vector<ggml_backend_t> journal_backends;
++
++    // one S row on the device for host saves (journal_scratch_row)
++    mutable ggml_context_ptr        journal_scratch_ctx;
++    mutable ggml_backend_buffer_ptr journal_scratch_buf;
++    mutable ggml_tensor *           journal_scratch = nullptr;
++
++    ggml_backend_t journal_backend_for(const ggml_tensor * t) const;
++
++    // the device scratch row, holding a copy of base row `row` of layer il
++    ggml_tensor * journal_scratch_row(int32_t il, uint32_t row) const;
++
++    // the persistent commit graph of journal_commit_row (tensors re-pointed per commit)
++    mutable ggml_context_ptr journal_commit_ctx;
++    mutable ggml_context_ptr journal_commit_gctx;
++    mutable ggml_cgraph *    journal_commit_gf = nullptr;
++    mutable ggml_tensor *    journal_commit_st = nullptr; // S row
++    mutable ggml_tensor *    journal_commit_jr = nullptr; // journal row
++    mutable ggml_tensor *    journal_commit_c  = nullptr; // commit node, a view of st
++
++    // apply `count` entries of journal row `row` of layer il to the single S row `dst`
++    void journal_commit_row(int32_t il, uint32_t row, uint32_t count, ggml_tensor * dst) const;
++
++    void journal_check_defined(llama_seq_id seq_id) const;
 +
 +    // Requested positions actually written by the last ubatch of a sequence.
 +    struct state_snapshot_record {
@@ -4086,10 +5862,39 @@ index b13b7b748..33e3e6412 100644
      size_t total_size() const;
  
      size_t size_r_bytes() const;
-@@ -173,6 +220,9 @@ public:
+@@ -129,6 +278,14 @@ private:
+     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
+     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+ 
++    // journal mode: R rows from cell_ranges (rollback planes), S as
++    // logical states of s_rows (base row, pending count); a selected snapshot
++    // dst replaces both
++    void state_write_data_journal(llama_io_write_i & io,
++            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
++            const std::vector<std::pair<uint32_t, uint32_t>> & s_rows,
++            const state_snapshot_dst * staged) const;
++
+     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
+     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+ };
+@@ -173,6 +330,23 @@ public:
  
      int32_t s_copy(int i) const;
  
++    // journal mode
++    bool          journal_enabled() const;
++    uint32_t      get_n_journal() const;
++    ggml_tensor * get_j_l(int32_t il) const;
++    int64_t       get_journal_h_k() const;
++    // S source row of cell head + i (no rollback plane)
++    int32_t       s_copy_base(int i) const;
++    // (row, count) commit pair of cell head + i
++    int32_t       journal_plan_row(int i) const;
++    int32_t       journal_plan_count(int i) const;
++    // the ubatch carries an in-pass snapshot request
++    bool          has_state_snapshot_request(const llama_ubatch & ubatch) const;
++    const llama_memory_recurrent::state_snapshot_dst * get_state_snapshot_dst(const llama_ubatch & ubatch, uint32_t slot) const;
++
 +    bool has_state_snapshots() const;
 +    std::vector<int32_t> state_snapshot_indices(const llama_ubatch & ubatch) const;
 +
@@ -4155,10 +5960,10 @@ index 34a798826..45891a4bf 100644
      for (size_t i = 0; i < cur_p->size; ++i) {
          const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ae67400c6..34ab3eed5 100644
+index ae67400c6..cd421b4f5 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
-@@ -500,21 +500,23 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+@@ -500,21 +500,30 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
  
          ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
      } else {
@@ -4171,14 +5976,21 @@ index ae67400c6..34ab3eed5 100644
 -        for (int64_t t = 1; t <= K; ++t) {
 -            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
 -            const int64_t s_slot = K - t;
++        const bool journal = mctx_cur->journal_enabled();
++
 +        // Normally these are the trailing K tokens. For an in-pass checkpoint
 +        // graph they are arbitrary post-token indices chosen by the server;
 +        // static views keep this path copy-only and avoid another gather kernel.
 +        GGML_ASSERT((int64_t) inp->snapshot_indices.size() == K);
 +        for (int64_t s_slot = 0; s_slot < K; ++s_slot) {
-+            const int64_t token_idx = inp->snapshot_indices[s_slot];
++            int64_t token_idx = inp->snapshot_indices[s_slot];
 +            if (token_idx < 0 || token_idx >= ubatch.n_seq_tokens) {
-+                continue;
++                // Journal: a rollback over every token of a short ubatch returns
++                // its input state, so plane n holds the input window.
++                if (!(journal && !inp->snapshot_request && s_slot == ubatch.n_seq_tokens)) {
++                    continue;
++                }
++                token_idx = -1;
 +            }
  
              ggml_tensor * conv_state_last =
@@ -4190,7 +6002,47 @@ index ae67400c6..34ab3eed5 100644
  
              ggml_tensor * conv_state_update =
                  ggml_view_2d(ctx0,
-@@ -539,7 +541,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -522,6 +531,16 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+                         conv_states_all->nb[1],
+                         (s_slot * mem_size + kv_head) * row_size);
+ 
++            // Journal: in-pass snapshots go to their checkpoint buffers, not to planes
++            if (journal && inp->snapshot_request && s_slot > 0) {
++                const auto * dst = mctx_cur->get_state_snapshot_dst(ubatch, (uint32_t) s_slot - 1);
++                if (dst == nullptr) {
++                    continue;
++                }
++                GGML_ASSERT(n_seqs == 1 && ggml_nelements(dst->r[il]) == row_count);
++                conv_state_update = dst->r[il];
++            }
++
+             ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+         }
+     }
+@@ -529,6 +548,22 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     return conv_input;
+ }
+ 
++ggml_tensor * llm_build_delta_net_base::build_journal_commit(
++        llm_graph_input_rs * inp,
++        ggml_tensor *        ssm_states_all,
++        int                  il) {
++    const auto * mctx_cur = inp->mctx;
++
++    GGML_ASSERT(mctx_cur->journal_enabled() && inp->s_journal_plan != nullptr);
++
++    ggml_tensor * states = ggml_gated_delta_net_commit(ctx0, ssm_states_all, mctx_cur->get_j_l(il), inp->s_journal_plan,
++            hparams.ssm_d_state, mctx_cur->get_journal_h_k(), hparams.ssm_dt_rank, (int) mctx_cur->get_n_journal(), 0);
++    cb(states, "journal_commit", il);
++    ggml_build_forward_expand(gf, states);
++
++    return states;
++}
++
+ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        ssm_states_all,
+@@ -539,7 +574,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
          ggml_tensor *        b,
          ggml_tensor *        s,
          int                  il,
@@ -4200,7 +6052,7 @@ index ae67400c6..34ab3eed5 100644
      const auto * mctx_cur   = inp->mctx;
      const auto   kv_head    = mctx_cur->get_head();
      const uint32_t mem_size = mctx_cur->get_size();
-@@ -554,6 +557,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -554,6 +590,7 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
      const bool keep = cparams.n_rs_seq > 0;
  
      GGML_ASSERT(state_rows == nullptr || keep); // rows mode is a ring-path optimization
@@ -4208,7 +6060,7 @@ index ae67400c6..34ab3eed5 100644
  
      if (!keep) {
          auto attn_out = build_delta_net(q, k, v, g, b, s, il);
-@@ -570,15 +574,28 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -570,15 +607,32 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
          return output;
      }
  
@@ -4223,6 +6075,10 @@ index ae67400c6..34ab3eed5 100644
      ggml_tensor * gg = raw ? gdn_raw_alpha : g;
      ggml_tensor * bb = raw ? gdn_raw_beta  : b;
  
++    if (mctx_cur->journal_enabled()) {
++        return build_recurrent_attn_journal(inp, ssm_states_all, q, k, v, gg, bb, raw, s, il, state_rows, commit_state);
++    }
++
      ggml_tensor * gdn_out;
 -    if (state_rows) {
 +    if (commit_state) {
@@ -4240,7 +6096,7 @@ index ae67400c6..34ab3eed5 100644
          // rows mode: the fused op reads each seq's live state directly from the
          // 2D cache view at row state_rows[seq] -- no gather
          gdn_out = ggml_gated_delta_net_rows(ctx0, q, k, v, gg, bb, s, state_rows, (int) K);
-@@ -589,6 +606,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -589,6 +643,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
      if (raw) {
          ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
      }
@@ -4252,7 +6108,7 @@ index ae67400c6..34ab3eed5 100644
      if (n_seq_tokens > 1) {
          res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
      } else {
-@@ -606,10 +628,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -606,10 +665,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
          0);
      cb(output, "attn_output", il);
  
@@ -4266,8 +6122,141 @@ index ae67400c6..34ab3eed5 100644
  
      if (state_rows) {
          // rows mode: scatter the compact snapshot region [D, n_written*n_seqs]
+@@ -646,3 +705,132 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+ 
+     return output;
+ }
++
++ggml_tensor * llm_build_delta_net_base::build_recurrent_attn_journal(
++        llm_graph_input_rs * inp,
++        ggml_tensor *        ssm_states_all,
++        ggml_tensor *        q,
++        ggml_tensor *        k,
++        ggml_tensor *        v,
++        ggml_tensor *        gg,
++        ggml_tensor *        bb,
++        bool                 raw,
++        ggml_tensor *        s,
++        int                  il,
++        ggml_tensor *        state_rows,
++        bool                 commit_state) {
++    const auto * mctx_cur   = inp->mctx;
++    const auto   kv_head    = mctx_cur->get_head();
++
++    const int64_t S_v          = v->ne[0];
++    const int64_t H_v          = v->ne[1];
++    const int64_t n_seqs       = v->ne[3];
++    const int64_t n_seq_tokens = q->ne[2];
++
++    const int64_t D         = S_v * S_v * H_v;
++    const int64_t K         = cparams.n_rs_seq + 1;
++    const int     n_journal = (int) mctx_cur->get_n_journal();
++    const size_t  row_size  = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
++
++    const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
++    const int64_t state_size_per_snap = D * n_seqs;
++
++    // the journal rows are sized for the k heads of the model; k must not be repeated to the v heads
++    GGML_ASSERT(k->ne[1] == mctx_cur->get_journal_h_k() && k->ne[0] == S_v);
++
++    // the base rows of the ubatch's cells
++    ggml_tensor * base_dst = ggml_view_3d(ctx0, ssm_states_all,
++        D, n_seqs, 1,
++        ssm_states_all->nb[1],
++        ssm_states_all->nb[1] * n_seqs,
++        (size_t) kv_head * row_size);
++
++    ggml_tensor * gdn_out;
++    if (inp->snapshot_request) {
++        // In-pass snapshots: the K-slot op. Slot 0 (final state) becomes
++        // the base, slot s the snapshot of request slot s-1 in its checkpoint
++        // buffer. No journal: no rollback is allowed after this ubatch.
++        GGML_ASSERT(n_seqs == 1 && (int64_t) inp->snapshot_indices.size() == K);
++        gdn_out = state_rows ?
++            ggml_gated_delta_net_rows(ctx0, q, k, v, gg, bb, s, state_rows, (int) K) :
++            ggml_gated_delta_net(ctx0, q, k, v, gg, bb, s, K);
++        if (raw) {
++            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
++        }
++        ggml_gated_delta_net_set_snapshot_indices(
++            gdn_out, inp->snapshot_indices.data(), (int32_t) inp->snapshot_indices.size());
++    } else if (commit_state) {
++        gdn_out = ggml_gated_delta_net_rows_commit_journal(ctx0, q, k, v, gg, bb, s, state_rows, base_dst, n_journal);
++        if (raw) {
++            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
++        }
++    } else {
++        // the journal is implemented for the commit and the gathered input only
++        GGML_ASSERT(state_rows == nullptr);
++        gdn_out = ggml_gated_delta_net_journal(ctx0, q, k, v, gg, bb, s, n_journal);
++        if (raw) {
++            ggml_gated_delta_net_set_raw_gates(gdn_out, gdn_raw_dt_bias, gdn_raw_a);
++        }
++    }
++    if (n_seq_tokens > 1) {
++        res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
++    } else {
++        res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
++    }
++
++    ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
++        S_v, H_v, n_seq_tokens, n_seqs,
++        ggml_row_size(gdn_out->type, S_v),
++        ggml_row_size(gdn_out->type, S_v * H_v),
++        ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
++        0);
++    cb(output, "attn_output", il);
++
++    if (inp->snapshot_request) {
++        for (int64_t slot = 0; slot < K; ++slot) {
++            if (inp->snapshot_indices[slot] < 0) {
++                continue;
++            }
++            ggml_tensor * dst = base_dst;
++            if (slot > 0) {
++                const auto * snap = mctx_cur->get_state_snapshot_dst(ubatch, (uint32_t) slot - 1);
++                if (snap == nullptr) {
++                    continue;
++                }
++                GGML_ASSERT(ggml_nelements(snap->s[il]) == D);
++                dst = snap->s[il];
++            }
++            ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
++                D, n_seqs, 1,
++                ggml_row_size(gdn_out->type, D),
++                ggml_row_size(gdn_out->type, state_size_per_snap),
++                ggml_row_size(gdn_out->type, attn_score_elems + slot * state_size_per_snap));
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
++        }
++        return output;
++    }
++
++    // the base state slot follows the scores unless the op committed it
++    if (!commit_state) {
++        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
++            D, n_seqs, 1,
++            ggml_row_size(gdn_out->type, D),
++            ggml_row_size(gdn_out->type, state_size_per_snap),
++            ggml_row_size(gdn_out->type, attn_score_elems));
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, base_dst));
++    }
++
++    // journal of each sequence -> journal rows of its cell
++    ggml_tensor * j_all = mctx_cur->get_j_l(il);
++    ggml_tensor * j_src = ggml_view_2d(ctx0, gdn_out,
++        j_all->ne[0], n_seqs,
++        ggml_row_size(gdn_out->type, j_all->ne[0]),
++        ggml_row_size(gdn_out->type, ggml_gated_delta_net_journal_offset(gdn_out)));
++    ggml_tensor * j_dst = ggml_view_2d(ctx0, j_all,
++        j_all->ne[0], n_seqs,
++        j_all->nb[1],
++        (size_t) kv_head * j_all->nb[1]);
++    ggml_build_forward_expand(gf, ggml_cpy(ctx0, j_src, j_dst));
++
++    return output;
++}
 diff --git a/src/models/models.h b/src/models/models.h
-index a70ca543d..1f56e3a42 100644
+index a70ca543d..148db0638 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -82,8 +82,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
@@ -4281,17 +6270,46 @@ index a70ca543d..1f56e3a42 100644
      // set per layer before build_recurrent_attn: the fused GDN op then receives the
      // pre-activation beta / alpha and folds sigmoid / softplus into its prologue
      // (ggml_gated_delta_net_set_raw_gates); the non-fused paths keep the activated g / b
-@@ -102,7 +102,8 @@ struct llm_build_delta_net_base : public llm_graph_context {
+@@ -92,6 +92,13 @@ struct llm_build_delta_net_base : public llm_graph_context {
+     ggml_tensor * gdn_raw_dt_bias = nullptr;
+     ggml_tensor * gdn_raw_a       = nullptr;
+ 
++    // rollback journal: apply the pending journal entries of the ubatch's source
++    // rows onto their S base rows; returns the S cache view to read from
++    ggml_tensor * build_journal_commit(
++            llm_graph_input_rs * inp,
++            ggml_tensor *        ssm_states_all,
++            int                  il);
++
+     ggml_tensor * build_recurrent_attn(
+             llm_graph_input_rs * inp,
+             ggml_tensor *        ssm_states_all,
+@@ -102,7 +109,23 @@ struct llm_build_delta_net_base : public llm_graph_context {
              ggml_tensor *        b,
              ggml_tensor *        s,
              int                  il,
 -            ggml_tensor *        state_rows = nullptr);
 +            ggml_tensor *        state_rows = nullptr,
 +            bool                 commit_state = false);
++
++    // build_recurrent_attn in rollback-journal mode (gg, bb: the gates the op takes)
++    ggml_tensor * build_recurrent_attn_journal(
++            llm_graph_input_rs * inp,
++            ggml_tensor *        ssm_states_all,
++            ggml_tensor *        q,
++            ggml_tensor *        k,
++            ggml_tensor *        v,
++            ggml_tensor *        gg,
++            ggml_tensor *        bb,
++            bool                 raw,
++            ggml_tensor *        s,
++            int                  il,
++            ggml_tensor *        state_rows,
++            bool                 commit_state);
  };
  
  struct llm_build_rwkv6_base : public llm_graph_context {
-@@ -2250,8 +2251,9 @@ struct llama_model_qwen35 : public llama_model_base {
+@@ -2250,8 +2273,9 @@ struct llama_model_qwen35 : public llama_model_base {
          graph(const llama_model & model, const llm_graph_params & params);
  
          // device-dependent path choices, scanned once per graph build (not per layer)
@@ -4304,7 +6322,7 @@ index a70ca543d..1f56e3a42 100644
          ggml_tensor * build_layer_attn(
          llm_graph_input_attn_kv * inp_attn,
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 8e0944bc5..907f1b35a 100644
+index 8e0944bc5..600932f62 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -1,4 +1,5 @@
@@ -4337,7 +6355,7 @@ index 8e0944bc5..907f1b35a 100644
          if (strcmp(reg_name, "MTL") != 0 && strcmp(reg_name, "CUDA") != 0 &&
              strcmp(reg_name, "ROCm") != 0 && strcmp(reg_name, "MUSA") != 0 && strcmp(reg_name, "CPU") != 0) {
              gdn_raw_gates_dev_ok = false;
-@@ -434,13 +439,15 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+@@ -434,20 +439,32 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
      // ring path: read per-seq live state directly from the cache inside the
      // fused GDN op (rows mode) instead of a gather per layer.
      // GGML_GDN_STATE_GATHER=1 restores the legacy gathered path (A/B).
@@ -4352,22 +6370,42 @@ index 8e0944bc5..907f1b35a 100644
      static const bool gdn_state_rows_env = getenv("GGML_GDN_STATE_GATHER") == nullptr;
  
 -    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok && cparams.n_rs_seq > 0;
-+    const bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok &&
-+                                cparams.n_rs_seq > 0 && n_seqs == 1;
++    // Rollback journal: S is read from base rows after the pending journal
++    // entries of the ubatch's source rows are applied to them.
++    const bool journal = mctx_cur->journal_enabled();
++
++    bool gdn_state_rows = gdn_state_rows_env && gdn_state_rows_dev_ok &&
++                          cparams.n_rs_seq > 0 && n_seqs == 1;
 +    const bool gdn_state_commit = gdn_state_rows && gdn_state_commit_dev_ok;
++    // the journal op exists for the commit path and the gathered input
++    if (journal && !gdn_state_commit && !inp->snapshot_request) {
++        gdn_state_rows = false;
++    }
++
++    ggml_tensor * ssm_states_read = journal ? build_journal_commit(inp, ssm_states_all, il) : ssm_states_all;
  
      ggml_tensor * state;
      if (gdn_state_rows) {
-@@ -521,7 +528,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+-        state = build_rs_cache_view(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++        state = build_rs_cache_view(inp, ssm_states_read, hparams.n_embd_s(), n_seqs, journal);
+         cb(state, "state_cache_view", il);
+     } else {
+-        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
++        state = build_rs(inp, ssm_states_read, hparams.n_embd_s(), n_seqs, ggml_get_rows, journal);
+         state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+         cb(state, "state_predelta", il);
+     }
+@@ -521,7 +538,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
      cb(v_conv, "v_conv_predelta", il);
  
      ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il,
 -            gdn_state_rows ? inp->s_copy_main : nullptr);
-+            gdn_state_rows ? inp->s_copy_main : nullptr, gdn_state_commit);
++            gdn_state_rows ? (journal ? inp->s_copy_base_main : inp->s_copy_main) : nullptr,
++            gdn_state_rows && gdn_state_commit);
  
      // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
      ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
-@@ -579,6 +586,135 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+@@ -579,6 +597,135 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
      int sections[4];
      std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
  

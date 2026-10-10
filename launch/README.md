@@ -8,10 +8,10 @@ The same arguments apply to both architectures. Compute capability 9.0 and newer
 
 ## Device memory
 
-With `sm_89.args` the server requires 9,704 MiB of device memory after load. The bounded device
-checkpoint pool (see Prompt checkpoints) can raise this to at most 12,336 MiB, so the card needs at
-least 12,336 MiB free for the server. Both figures include the MTP drafter. A larger `--ctx-size`
-or more slots need more; for two slots see Two slots.
+With `sm_89.args` the server requires 9,276 MiB of device memory after load. The bounded device
+checkpoint pool and the in-decode snapshot buffers (see Prompt checkpoints) can raise this to at
+most 12,170 MiB, so the card needs at least 12,170 MiB free for the server. Both figures include the
+MTP drafter. A larger `--ctx-size` or more slots need more; for two slots see Two slots.
 
 ## Run
 
@@ -73,6 +73,10 @@ checkpoint. The cost is time: a checkpoint kept in host memory is copied over PC
 and when it is restored, so prompt reuse from it takes longer than from a device checkpoint. `0`
 keeps every checkpoint in host memory.
 
+On CUDA a prompt decode that takes in-decode checkpoints writes them into up to three checkpoint
+buffers per slot. These buffers come from free pool entries first; when the pool has none, they are
+allocated beyond N and released at the next decode, so at most three per slot exist above the pool.
+
 ## Two slots
 
 `sm_89.args` runs one slot, so requests are served one at a time. To serve two requests at once,
@@ -84,9 +88,15 @@ change two values in a copy of the file:
 | `--ctx-size` | `32768` | `65536` |
 
 `--ctx-size` is the total for all slots, so each slot still holds 32,768 tokens. With two slots the
-server requires 12,478 MiB of device memory after load and up to 15,110 MiB with the device
-checkpoint pool full; both include the MTP drafter. A 24 GB card has room for this.
-`--ctx-checkpoints-device` lowers the ceiling (see Prompt checkpoints).
+server requires 11,624 MiB of device memory after load and up to 14,978 MiB with the device
+checkpoint pool and the snapshot buffers full; both include the MTP drafter. A 24 GB card has room
+for this. `--ctx-checkpoints-device` lowers the ceiling (see Prompt checkpoints).
+
+To reduce device memory further, store the target model's attention KV cache as 8-bit values: in
+the same copy, set `--cache-type-k q8_0` and `--cache-type-v q8_0`. This roughly halves the KV
+cache, the largest allocation that grows with `--ctx-size`. Outputs change slightly compared with
+f16, because attention reads quantized keys and values. The drafter's KV cache stays f16
+(`--spec-draft-type-k` and `--spec-draft-type-v`, default f16).
 
 ## Environment
 

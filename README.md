@@ -50,11 +50,23 @@ fallback.
   with several sequences use the gathered path.
 - Recurrent-state snapshots taken inside the prompt decode and used as prompt-cache checkpoints.
   This needs a model whose GGUF architecture is `qwen35` or `qwen35moe`, and speculative decoding
-  (for example `--spec-type draft-mtp`) with `--spec-draft-n-max` from 1 to 3; the recurrent
-  rollback planes hold the snapshots. Otherwise checkpoints are saved as upstream does.
+  (for example `--spec-type draft-mtp`) with `--spec-draft-n-max` from 1 to 3. With the rollback
+  journal below, the decode writes the snapshots directly into device checkpoint buffers; otherwise
+  the recurrent rollback planes hold them. Without these conditions checkpoints are saved as
+  upstream does.
+- A rollback journal for the recurrent state under speculative decoding. Instead of a full copy of
+  the gated delta net state for every draft position a rollback may return to, each sequence keeps
+  one base state and, for each of its last tokens, the operands of the state update (k, delta and
+  the gate). Rejecting draft tokens drops their entries; the remaining entries are applied to the
+  base state before the next read, with the same floating-point operations the update used, so the
+  state is bitwise the one a full copy would hold. The convolution state keeps its per-position
+  copies. This needs a `qwen35` model, `--spec-draft-n-max` from 1 to 3 and every recurrent layer
+  on a CUDA device; otherwise the full per-position copies are used.
 - A bounded pool of device-resident checkpoints, shared by all slots. Its size is set with
   `--ctx-checkpoints-device N` (default 16; 0 keeps every checkpoint in host memory). When the pool
-  is full, checkpoints use host memory. See
+  is full, checkpoints use host memory. With the rollback journal, a prompt decode that takes
+  in-decode checkpoints holds up to three checkpoint buffers per slot until the next decode, taken
+  from free pool entries first and otherwise allocated beyond the pool. See
   [Prompt checkpoints](launch/README.md#prompt-checkpoints).
 - The MTP drafter receives every prompt row after a cache restore. With one active sequence, an
   MTP drafter whose GGUF architecture is `qwen35`, `--spec-draft-n-max 3` and `--spec-draft-p-min`
@@ -141,3 +153,4 @@ Versions are the commits of this repository that change `patches/ambient-engine.
 | --- | --- | --- |
 | 1 | 2026-10-07 | 2028-10-07 |
 | 2 | 2026-10-09 | 2028-10-09 |
+| 3 | 2026-10-10 | 2028-10-10 |
